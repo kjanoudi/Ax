@@ -20,8 +20,11 @@ from ax.core.generator_run import GeneratorRun
 from ax.core.metric import Metric
 from ax.core.multi_type_experiment import MultiTypeExperiment
 from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
-from ax.core.optimization_config import OptimizationConfig
-from ax.core.outcome_constraint import OutcomeConstraint
+from ax.core.optimization_config import (
+    MultiObjectiveOptimizationConfig,
+    OptimizationConfig,
+)
+from ax.core.outcome_constraint import ObjectiveThreshold, OutcomeConstraint
 from ax.core.parameter import (
     ChoiceParameter,
     FixedParameter,
@@ -51,10 +54,13 @@ from ax.metrics.hartmann6 import AugmentedHartmann6Metric, Hartmann6Metric
 from ax.modelbridge.factory import Cont_X_trans, get_factorial, get_sobol
 from ax.models.torch.botorch_modular.acquisition import Acquisition
 from ax.models.torch.botorch_modular.kg import KnowledgeGradient
+from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
 from ax.models.torch.botorch_modular.model import BoTorchModel
 from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.runners.synthetic import SyntheticRunner
 from ax.utils.common.logger import get_logger
+from ax.utils.common.typeutils import checked_cast, not_none
+from ax.utils.measurement.synthetic_functions import branin
 from botorch.acquisition.acquisition import AcquisitionFunction
 from botorch.acquisition.monte_carlo import qExpectedImprovement
 from botorch.models.gp_regression import SingleTaskGP
@@ -86,15 +92,21 @@ def get_experiment() -> Experiment:
 def get_branin_experiment(
     has_optimization_config: bool = True,
     with_batch: bool = False,
+    with_trial: bool = False,
     with_status_quo: bool = False,
     with_fidelity_parameter: bool = False,
+    with_choice_parameter: bool = False,
+    search_space: Optional[SearchSpace] = None,
+    minimize: bool = False,
 ) -> Experiment:
+    search_space = search_space or get_branin_search_space(
+        with_fidelity_parameter=with_fidelity_parameter,
+        with_choice_parameter=with_choice_parameter,
+    )
     exp = Experiment(
         name="branin_test_experiment",
-        search_space=get_branin_search_space(
-            with_fidelity_parameter=with_fidelity_parameter
-        ),
-        optimization_config=get_branin_optimization_config()
+        search_space=search_space,
+        optimization_config=get_branin_optimization_config(minimize=minimize)
         if has_optimization_config
         else None,
         runner=SyntheticRunner(),
@@ -110,6 +122,11 @@ def get_branin_experiment(
         exp.new_batch_trial(optimize_for_power=with_status_quo).add_generator_run(
             sobol_run
         )
+
+    if with_trial:
+        sobol_generator = get_sobol(search_space=exp.search_space)
+        sobol_run = sobol_generator.gen(n=1)
+        exp.new_trial(generator_run=sobol_run)
 
     return exp
 
@@ -237,11 +254,7 @@ def get_experiment_with_data() -> Experiment:
 
 
 def get_experiment_with_multi_objective() -> Experiment:
-    objective = get_multi_objective()
-    outcome_constraints = [get_outcome_constraint()]
-    optimization_config = OptimizationConfig(
-        objective=objective, outcome_constraints=outcome_constraints
-    )
+    optimization_config = get_multi_objective_optimization_config()
 
     exp = Experiment(
         name="test_experiment_multi_objective",
@@ -310,17 +323,13 @@ def get_experiment_with_scalarized_objective() -> Experiment:
 
 
 def get_search_space() -> SearchSpace:
-    parameters = [
+    parameters: List[Parameter] = [
         get_range_parameter(),
         get_range_parameter2(),
         get_choice_parameter(),
         get_fixed_parameter(),
     ]
     return SearchSpace(
-        # pyre: Expected `List[ax.core.parameter.Parameter]` for 1st
-        # pyre: parameter `parameters` to call `ax.core.search_space.
-        # pyre: SearchSpace.__init__` but got `List[typing.
-        # pyre-fixme[6]: Union[ChoiceParameter, FixedParameter, RangeParameter]]`.
         parameters=parameters,
         parameter_constraints=[
             get_order_constraint(),
@@ -330,12 +339,20 @@ def get_search_space() -> SearchSpace:
     )
 
 
-def get_branin_search_space(with_fidelity_parameter: bool = False) -> SearchSpace:
+def get_branin_search_space(
+    with_fidelity_parameter: bool = False, with_choice_parameter: bool = False
+) -> SearchSpace:
     parameters = [
         RangeParameter(
             name="x1", parameter_type=ParameterType.FLOAT, lower=-5, upper=10
         ),
-        RangeParameter(
+        ChoiceParameter(
+            name="x2",
+            parameter_type=ParameterType.FLOAT,
+            values=[float(x) for x in range(0, 16)],
+        )
+        if with_choice_parameter
+        else RangeParameter(
             name="x2", parameter_type=ParameterType.FLOAT, lower=0, upper=15
         ),
     ]
@@ -462,7 +479,7 @@ def get_batch_trial(abandon_arm: bool = True) -> BatchTrial:
 
 
 def get_batch_trial_with_repeated_arms(num_repeated_arms: int) -> BatchTrial:
-    """ Create a batch that contains both new arms and N arms from the last
+    """Create a batch that contains both new arms and N arms from the last
     existed trial in the experiment. Where N is equal to the input argument
     'num_repeated_arms'.
     """
@@ -629,6 +646,12 @@ def get_factorial_metric(name: str = "success_metric") -> FactorialMetric:
 ##############################
 
 
+def get_objective_threshold() -> ObjectiveThreshold:
+    return ObjectiveThreshold(
+        metric=Metric(name="m1"), bound=-0.25, op=ComparisonOp.GEQ
+    )
+
+
 def get_outcome_constraint() -> OutcomeConstraint:
     return OutcomeConstraint(metric=Metric(name="m2"), op=ComparisonOp.GEQ, bound=-0.25)
 
@@ -661,8 +684,8 @@ def get_scalarized_objective() -> Objective:
     )
 
 
-def get_branin_objective() -> Objective:
-    return Objective(metric=get_branin_metric(), minimize=False)
+def get_branin_objective(minimize: bool = False) -> Objective:
+    return Objective(metric=get_branin_metric(), minimize=minimize)
 
 
 def get_branin_multi_objective() -> Objective:
@@ -700,16 +723,27 @@ def get_optimization_config() -> OptimizationConfig:
     )
 
 
+def get_multi_objective_optimization_config() -> OptimizationConfig:
+    objective = get_multi_objective()
+    outcome_constraints = [get_outcome_constraint()]
+    objective_thresholds = [get_objective_threshold()]
+    return MultiObjectiveOptimizationConfig(
+        objective=objective,
+        outcome_constraints=outcome_constraints,
+        objective_thresholds=objective_thresholds,
+    )
+
+
 def get_optimization_config_no_constraints() -> OptimizationConfig:
     return OptimizationConfig(objective=Objective(metric=Metric("test_metric")))
 
 
-def get_branin_optimization_config() -> OptimizationConfig:
-    return OptimizationConfig(objective=get_branin_objective())
+def get_branin_optimization_config(minimize: bool = False) -> OptimizationConfig:
+    return OptimizationConfig(objective=get_branin_objective(minimize=minimize))
 
 
 def get_branin_multi_objective_optimization_config() -> OptimizationConfig:
-    return OptimizationConfig(objective=get_branin_multi_objective())
+    return MultiObjectiveOptimizationConfig(objective=get_branin_multi_objective())
 
 
 def get_augmented_branin_optimization_config() -> OptimizationConfig:
@@ -861,18 +895,56 @@ def get_data(trial_index: int = 0) -> Data:
     return Data(df=pd.DataFrame.from_records(df_dict))
 
 
-def get_branin_data(trial_indices: Optional[Iterable[int]] = None) -> Data:
-    df_dicts = [
-        {
-            "trial_index": trial_index,
-            "metric_name": "branin",
-            "arm_name": f"{trial_index}_0",
-            "mean": 5.0,
-            "sem": 0.0,
-        }
-        for trial_index in (trial_indices or [0])
-    ]
+def get_branin_data(
+    trial_indices: Optional[Iterable[int]] = None,
+    trials: Optional[Iterable[Trial]] = None,
+) -> Data:
+    if trial_indices and trials:
+        raise ValueError("Expected `trial_indices` or `trials`, not both.")
+    if trials:
+        df_dicts = [
+            {
+                "trial_index": trial.index,
+                "metric_name": "branin",
+                "arm_name": not_none(checked_cast(Trial, trial).arm).name,
+                "mean": branin(
+                    float(not_none(trial.arm).parameters["x1"]),  # pyre-ignore[6]
+                    float(not_none(trial.arm).parameters["x2"]),  # pyre-ignore[6]
+                ),
+                "sem": 0.0,
+            }
+            for trial in trials
+        ]
+    else:
+        df_dicts = [
+            {
+                "trial_index": trial_index,
+                "metric_name": "branin",
+                "arm_name": f"{trial_index}_0",
+                "mean": 5.0,
+                "sem": 0.0,
+            }
+            for trial_index in (trial_indices or [0])
+        ]
     return Data(df=pd.DataFrame.from_records(df_dicts))
+
+
+def get_branin_data_batch(batch: BatchTrial) -> Data:
+    return Data(
+        pd.DataFrame(
+            {
+                "arm_name": [arm.name for arm in batch.arms],
+                "metric_name": "branin",
+                "mean": [
+                    # pyre-ignore[6]: This function can fail if a parameter value
+                    # does not support conversion to float.
+                    branin(float(arm.parameters["x1"]), float(arm.parameters["x2"]))
+                    for arm in batch.arms
+                ],
+                "sem": 0.1,
+            }
+        )
+    )
 
 
 def get_branin_data_multi_objective(
@@ -953,7 +1025,20 @@ def get_botorch_model_with_default_acquisition_class() -> BoTorchModel:
 
 
 def get_surrogate() -> Surrogate:
-    return Surrogate(get_model_type())
+    return Surrogate(
+        botorch_model_class=get_model_type(),
+        mll_class=get_mll_type(),
+        model_options={"some_option": "some_value"},
+    )
+
+
+def get_list_surrogate() -> Surrogate:
+    return ListSurrogate(
+        botorch_submodel_class_per_outcome={"m": get_model_type()},
+        submodel_options_per_outcome={"m": {"some_option": "some_value"}},
+        submodel_options={"shared_option": "shared_option_value"},
+        mll_class=get_mll_type(),
+    )
 
 
 def get_acquisition_type() -> Type[Acquisition]:

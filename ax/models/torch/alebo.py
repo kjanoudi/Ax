@@ -85,6 +85,7 @@ class ALEBOKernel(Kernel):
         last_dim_is_batch: bool = False,
         **params: Any,
     ) -> Tensor:
+        """Compute kernel distance."""
         # Unpack Uvec into an upper triangular matrix U
         shapeU = self.Uvec.shape[:-1] + torch.Size([self.d, self.d])
         U_t = torch.zeros(shapeU, dtype=self.B.dtype, device=self.B.device)
@@ -267,10 +268,8 @@ def get_map_model(
         mll.train()
         mll, info_dict = fit_gpytorch_scipy(mll, track_iterations=False, method="tnc")
         logger.debug(info_dict)
-        # pyre-fixme[6]: Expected `List[botorch.optim.fit.OptimizationIteration]`
-        #  for 1st param but got `float`.
-        # pyre-fixme[6]: Expected `List[botorch.optim.fit.OptimizationIteration]`
-        #  for 1st param but got `float`.
+        # pyre-fixme[58]: `<` is not supported for operand types
+        #  `Union[List[botorch.optim.fit.OptimizationIteration], float]` and `float`.
         if info_dict["fopt"] < f_best:
             f_best = float(info_dict["fopt"])  # pyre-ignore
             sd_best = m.state_dict()
@@ -415,7 +414,9 @@ def extract_map_statedict(
         else:
             model_idx = 0
             param_name = k
-        map_sds[model_idx][param_name] = torch.select(v, 0, 0)
+        if len(v.shape) > 1:
+            v = torch.select(v, 0, 0)
+        map_sds[model_idx][param_name] = v
     return map_sds
 
 
@@ -489,7 +490,13 @@ def alebo_acqf_optimizer(
     """
     candidate_list, acq_value_list = [], []
     candidates = torch.tensor([], device=B.device, dtype=B.dtype)
-    base_X_pending = acq_function.X_pending  # pyre-ignore
+    try:
+        base_X_pending = acq_function.X_pending  # pyre-ignore
+        acq_has_X_pend = True
+    except AttributeError:
+        base_X_pending = None
+        acq_has_X_pend = False
+        assert n == 1
     for i in range(n):
         # Generate initial points for optimization inside embedding
         m_init = ALEBOInitializer(B.cpu().numpy(), nsamp=10 * raw_samples)
@@ -518,13 +525,15 @@ def alebo_acqf_optimizer(
             candidate_list.append(candidate)
             acq_value_list.append(acq_value)
             candidates = torch.cat(candidate_list, dim=-2)
-            acq_function.set_X_pending(
-                torch.cat([base_X_pending, candidates], dim=-2)
-                if base_X_pending is not None
-                else candidates
-            )
+            if acq_has_X_pend:
+                acq_function.set_X_pending(
+                    torch.cat([base_X_pending, candidates], dim=-2)
+                    if base_X_pending is not None
+                    else candidates
+                )
         logger.info(f"Generated sequential candidate {i+1} of {n}")
-    acq_function.set_X_pending(base_X_pending)
+    if acq_has_X_pend:
+        acq_function.set_X_pending(base_X_pending)
     return candidates, torch.stack(acq_value_list)
 
 
@@ -560,8 +569,6 @@ class ALEBO(BotorchModel):
             acqf_optimizer=alebo_acqf_optimizer,
         )
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `Xs` expected.
     @copy_doc(TorchModel.fit)
     def fit(
         self,
@@ -587,16 +594,12 @@ class ALEBO(BotorchModel):
         self.dtype = self.B.dtype
         self.model = self.get_and_fit_model(Xs=self.Xs, Ys=self.Ys, Yvars=self.Yvars)
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `X` expected.
     @copy_doc(TorchModel.predict)
     def predict(self, X: Tensor) -> Tuple[Tensor, Tensor]:
         Xd = (self.B @ X.t()).t()  # Project down
         with gpytorch.settings.max_cholesky_size(2000):
             return super().predict(X=Xd)
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `bounds` expected.
     @copy_doc(TorchModel.best_point)
     def best_point(
         self,
@@ -653,7 +656,7 @@ class ALEBO(BotorchModel):
                 "B": self.B,
             },
         }
-        Xd_opt, w, _gen_metadata, _candidate_metadata = super().gen(
+        Xd_opt, w, gen_metadata, candidate_metadata = super().gen(
             n=n,
             bounds=[(-1e8, 1e8)] * self.B.shape[0],
             objective_weights=objective_weights,
@@ -671,10 +674,8 @@ class ALEBO(BotorchModel):
         # pyre-fixme[7]: Expected `Tuple[Tensor, Tensor, Dict[str, typing.Any],
         #  List[Optional[Dict[str, typing.Any]]]]` but got `Tuple[typing.Any, Tensor,
         #  Dict[str, typing.Any], None]`.
-        return Xopt, w, {}, None
+        return Xopt, w, gen_metadata, candidate_metadata
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `Xs` expected.
     @copy_doc(TorchModel.update)
     def update(
         self,
@@ -682,6 +683,7 @@ class ALEBO(BotorchModel):
         Ys: List[Tensor],
         Yvars: List[Tensor],
         candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
+        **kwargs: Any,
     ) -> None:
         if self.model is None:
             raise RuntimeError(
@@ -700,8 +702,6 @@ class ALEBO(BotorchModel):
             Xs=self.Xs, Ys=self.Ys, Yvars=self.Yvars, state_dicts=state_dicts
         )
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `X_test` expected.
     @copy_doc(TorchModel.cross_validate)
     def cross_validate(
         self,
@@ -709,6 +709,7 @@ class ALEBO(BotorchModel):
         Ys_train: List[Tensor],
         Yvars_train: List[Tensor],
         X_test: Tensor,
+        **kwargs: Any,
     ) -> Tuple[Tensor, Tensor]:
         if self.model is None:
             raise RuntimeError(

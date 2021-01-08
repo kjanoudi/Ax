@@ -9,7 +9,8 @@ from enum import Enum
 from typing import Dict, List, Optional, Type, Union
 
 from ax.core.types import TParamValue
-from ax.utils.common.equality import Base
+from ax.exceptions.core import UserInputError
+from ax.utils.common.base import Base
 
 
 FIXED_CHOICE_PARAM_ERROR = (
@@ -123,7 +124,7 @@ class RangeParameter(Parameter):
             target_value: Target value of this parameter if it is a fidelity.
         """
         if is_fidelity and (target_value is None):
-            raise ValueError(
+            raise UserInputError(
                 "`target_value` should not be None for the fidelity parameter: "
                 "{}".format(name)
             )
@@ -152,17 +153,17 @@ class RangeParameter(Parameter):
             ParameterType.INT,
             ParameterType.FLOAT,
         ):
-            raise ValueError("RangeParameter type must be int or float.")
-        # pyre-fixme[6]: `>=` is not supported for operand types `Union[None, bool,
+            raise UserInputError("RangeParameter type must be int or float.")
+        # pyre-fixme[58]: `>=` is not supported for operand types `Union[None, bool,
         #  float, int, str]` and `Union[None, bool, float, int, str]`.
         if lower >= upper:
-            raise ValueError("max must be strictly larger than min.")
-        # pyre-fixme[6]: `<=` is not supported for operand types `Union[None, bool,
+            raise UserInputError("max must be strictly larger than min.")
+        # pyre-fixme[58]: `<=` is not supported for operand types `Union[None, bool,
         #  float, int, str]` and `int`.
         if log_scale and lower <= 0:
-            raise ValueError("Cannot take log when min <= 0.")
+            raise UserInputError("Cannot take log when min <= 0.")
         if not (self.is_valid_type(lower)) or not (self.is_valid_type(upper)):
-            raise ValueError(
+            raise UserInputError(
                 f"[{lower}, {upper}] is an invalid range for this parameter."
             )
 
@@ -202,8 +203,7 @@ class RangeParameter(Parameter):
 
     @property
     def log_scale(self) -> bool:
-        """Whether to sample in log space when drawing random values of the parameter.
-        """
+        """Whether the parameter's random values should be sampled from log space."""
         return self._log_scale
 
     def update_range(
@@ -221,6 +221,7 @@ class RangeParameter(Parameter):
             lower = self._lower
         if upper is None:
             upper = self._upper
+
         cast_lower = self.cast(lower)
         cast_upper = self.cast(upper)
         self._validate_range_param(
@@ -236,10 +237,10 @@ class RangeParameter(Parameter):
         # Re-scale min and max to new digits definition
         cast_lower = self.cast(self._lower)
         cast_upper = self.cast(self._upper)
-        # pyre-fixme[6]: `>=` is not supported for operand types `Union[None, bool,
+        # pyre-fixme[58]: `>=` is not supported for operand types `Union[None, bool,
         #  float, int, str]` and `Union[None, bool, float, int, str]`.
         if cast_lower >= cast_upper:
-            raise ValueError(
+            raise UserInputError(
                 f"Lower bound {cast_lower} is >= upper bound {cast_upper}."
             )
 
@@ -272,13 +273,15 @@ class RangeParameter(Parameter):
 
     def is_valid_type(self, value: TParamValue) -> bool:
         """Same as default except allows floats whose value is an int
-           for Int parameters.
+        for Int parameters.
         """
         if not (isinstance(value, float) or isinstance(value, int)):
             return False
 
         # This might have issues with ints > 2^24
         if self.parameter_type is ParameterType.INT:
+            # pyre-fixme[6]: Expected `Union[_SupportsIndex, bytearray, bytes, str,
+            #  typing.SupportsFloat]` for 1st param but got `Union[None, float, str]`.
             return isinstance(value, int) or float(value).is_integer()
         return True
 
@@ -349,7 +352,7 @@ class ChoiceParameter(Parameter):
             target_value: Target value of this parameter if it's fidelity.
         """
         if is_fidelity and (target_value is None):
-            raise ValueError(
+            raise UserInputError(
                 "`target_value` should not be None for the fidelity parameter: "
                 "{}".format(name)
             )
@@ -362,7 +365,7 @@ class ChoiceParameter(Parameter):
         self._target_value = self.cast(target_value)
         # A choice parameter with only one value is a FixedParameter.
         if not len(values) > 1:
-            raise ValueError(FIXED_CHOICE_PARAM_ERROR)
+            raise UserInputError(FIXED_CHOICE_PARAM_ERROR)
         self._values = self._cast_values(values)
 
     @property
@@ -395,7 +398,7 @@ class ChoiceParameter(Parameter):
         """
         # A choice parameter with only one value is a FixedParameter.
         if not len(values) > 1:
-            raise ValueError(FIXED_CHOICE_PARAM_ERROR)
+            raise UserInputError(FIXED_CHOICE_PARAM_ERROR)
         self._values = self._cast_values(values)
         return self
 
@@ -429,6 +432,7 @@ class ChoiceParameter(Parameter):
             name=self._name,
             parameter_type=self._parameter_type,
             values=self._values,
+            is_ordered=self._is_ordered,
             is_task=self._is_task,
             is_fidelity=self._is_fidelity,
             target_value=self._target_value,
@@ -471,7 +475,7 @@ class FixedParameter(Parameter):
             target_value: Target value of this parameter if it is a fidelity.
         """
         if is_fidelity and (target_value is None):
-            raise ValueError(
+            raise UserInputError(
                 "`target_value` should not be None for the fidelity parameter: "
                 "{}".format(name)
             )

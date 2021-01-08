@@ -57,12 +57,15 @@ from ax.utils.testing.core_stubs import (
     get_fixed_parameter,
     get_generator_run,
     get_hartmann_metric,
+    get_list_surrogate,
     get_metric,
     get_mll_type,
     get_model_type,
     get_multi_objective,
+    get_multi_objective_optimization_config,
     get_multi_type_experiment,
     get_objective,
+    get_objective_threshold,
     get_optimization_config,
     get_order_constraint,
     get_outcome_constraint,
@@ -103,11 +106,14 @@ TEST_CASES = [
     ("Hartmann6Metric", get_hartmann_metric),
     ("GenerationStrategy", partial(get_generation_strategy, with_experiment=True)),
     ("GeneratorRun", get_generator_run),
+    ("ListSurrogate", get_list_surrogate),
     ("Metric", get_metric),
     ("MultiObjective", get_multi_objective),
+    ("MultiObjectiveOptimizationConfig", get_multi_objective_optimization_config),
     ("MultiTypeExperiment", get_multi_type_experiment),
     ("ObservationFeatures", get_observation_features),
     ("Objective", get_objective),
+    ("ObjectiveThreshold", get_objective_threshold),
     ("OptimizationConfig", get_optimization_config),
     ("OrderConstraint", get_order_constraint),
     ("OutcomeConstraint", get_outcome_constraint),
@@ -158,6 +164,9 @@ ENCODE_DECODE_FIELD_MAPS = {
     ),
     "GeneratorRun": EncodeDecodeFieldsMap(
         encoded_only=["arms", "weights"], python_only=["arm_weight_table"]
+    ),
+    "ListSurrogate": EncodeDecodeFieldsMap(
+        python_only=["model_options", "botorch_model_class"]
     ),
     "MultiTypeExperiment": EncodeDecodeFieldsMap(
         python_only=[
@@ -329,9 +338,11 @@ class JSONStoreTest(TestCase):
                     json_keys.remove(encoded)
                     json_keys.add(python)
             # TODO: Remove this check if able. `_slotnames__` is not a class attribute
-            # when testing locally, but it is a class attribute on Travis.
+            # when testing locally, but it is a class attribute on Travis
             if class_ == "Type[Model]":
                 object_keys.discard("_slotnames__")
+            if class_ == "Type[MarginalLogLikelihood]":
+                object_keys.discard("add_other_terms")
             self.assertEqual(
                 object_keys,
                 json_keys,
@@ -366,8 +377,10 @@ class JSONStoreTest(TestCase):
         self.assertIsNone(new_generation_strategy.model)
 
         # Check that we can encode and decode the generation strategy after
-        # it has generated some generator runs.
-        generation_strategy = new_generation_strategy
+        # it has generated some generator runs. Since we now need to `gen`,
+        # we remove the fake callable kwarg we added, since model does not
+        # expect it.
+        generation_strategy = get_generation_strategy(with_callable_model_kwarg=False)
         gr = generation_strategy.gen(experiment)
         gs_json = object_to_json(generation_strategy)
         new_generation_strategy = generation_strategy_from_json(gs_json)

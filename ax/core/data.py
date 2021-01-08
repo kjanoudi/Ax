@@ -13,7 +13,7 @@ from typing import Dict, Iterable, Optional, Set, Type
 import numpy as np
 import pandas as pd
 from ax.core.types import TFidelityTrialEvaluation, TTrialEvaluation
-from ax.utils.common.equality import Base
+from ax.utils.common.base import Base
 
 
 TPdTimestamp = pd.Timestamp
@@ -31,7 +31,10 @@ COLUMN_DATA_TYPES = {
     "random_split": np.int64,
     "fidelities": str,  # Dictionary stored as json
 }
-REQUIRED_COLUMNS = {"arm_name", "metric_name", "mean"}
+# Note: Although the SEM (standard error of the mean) is a required column in data,
+# downstream models can infer missing SEMs. Simply specify NaN as the SEM value,
+# either in your Metric class or in Data explicitly.
+REQUIRED_COLUMNS = {"arm_name", "metric_name", "mean", "sem"}
 
 
 class Data(Base):
@@ -49,7 +52,9 @@ class Data(Base):
     """
 
     def __init__(
-        self, df: Optional[pd.DataFrame] = None, description: Optional[str] = None
+        self,
+        df: Optional[pd.DataFrame] = None,
+        description: Optional[str] = None,
     ) -> None:
         """Init Data.
 
@@ -115,11 +120,44 @@ class Data(Base):
         return COLUMN_DATA_TYPES
 
     @staticmethod
-    def from_multiple_data(data: Iterable[Data]) -> Data:
+    def from_multiple_data(
+        data: Iterable[Data], subset_metrics: Optional[Iterable[str]] = None
+    ) -> Data:
+        """Combines multiple data objects into one (with the concatenated
+        underlying dataframe).
+
+        NOTE: if one or more data objects in the iterable is of a custom
+        subclass of `Data`, object of that class will be returned. If
+        the iterable contains multiple types of `Data`, an error will be
+        raised.
+
+        Args:
+            data: Iterable of Ax `Data` objects to combine.
+            subset_metrics: If specified, combined `Data` will only contain
+                metrics, names of which appear in this iterable,
+                in the underlying dataframe.
+        """
         dfs = [datum.df for datum in data]
+
         if len(dfs) == 0:
             return Data()
-        return Data(df=pd.concat(dfs, axis=0, sort=True))
+
+        if subset_metrics:
+            dfs = [df.loc[df["metric_name"].isin(subset_metrics)] for df in dfs]
+
+        # obtain type of first elt in iterable (we know it's not empty)
+        data_type = type(data[0])
+
+        # check if all types in iterable match the first type
+        if all((type(datum) is data_type) for datum in data):
+            # if all types in iterable are subclasses of Data, return the subclass
+            if issubclass(data_type, Data):
+                return data_type(df=pd.concat(dfs, axis=0, sort=True))
+            else:
+                # if not, return the original Data object
+                return Data(df=pd.concat(dfs, axis=0, sort=True))
+        else:
+            raise ValueError("More than one custom data type found in data iterable")
 
     @staticmethod
     def from_evaluations(
@@ -229,7 +267,15 @@ class Data(Base):
             str: The hash of the DataFrame.
 
         """
-        return md5(self.df.to_json().encode("utf-8")).hexdigest()  # pyre-ignore
+        # pyre-fixme[16]: `Optional` has no attribute `encode`.
+        return md5(self.df.to_json().encode("utf-8")).hexdigest()
+
+    @property
+    def metric_names(self) -> Set[str]:
+        """Set of metric names that appear in the underlying dataframe of
+        this `Data` object.
+        """
+        return set() if self.df.empty else set(self.df["metric_name"].values)
 
 
 def set_single_trial(data: Data) -> Data:

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from inspect import isabstract
+from logging import Logger
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -17,8 +17,9 @@ from ax.models.torch.utils import (
     pick_best_out_of_sample_point_acqf_class,
     predict_from_model,
 )
+from ax.utils.common.base import Base
 from ax.utils.common.constants import Keys
-from ax.utils.common.equality import Base
+from ax.utils.common.logger import get_logger
 from ax.utils.common.typeutils import checked_cast, checked_cast_optional, not_none
 from botorch.fit import fit_gpytorch_model
 from botorch.models.model import Model
@@ -28,6 +29,15 @@ from gpytorch.likelihoods.likelihood import Likelihood
 from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
 from gpytorch.mlls.marginal_log_likelihood import MarginalLogLikelihood
 from torch import Tensor
+
+
+NOT_YET_FIT_MSG = (
+    "Underlying BoTorch `Model` has not yet received its training_data."
+    "Please fit the model first."
+)
+
+
+logger: Logger = get_logger(__name__)
 
 
 class Surrogate(Base):
@@ -43,6 +53,8 @@ class Surrogate(Base):
         botorch_model_class: `Model` class to be used as the underlying
             BoTorch model.
         mll_class: `MarginalLogLikelihood` class to use for model-fitting.
+        model_options: Dictionary of options / kwargs for the BoTorch
+            `Model` constructed during `Surrogate.fit`.
         kernel_class: `Kernel` class, not yet used. Will be used to
             construct custom BoTorch `Model` in the future.
         kernel_options: Kernel kwargs, not yet used. Will be used to
@@ -53,13 +65,14 @@ class Surrogate(Base):
 
     botorch_model_class: Type[Model]
     mll_class: Type[MarginalLogLikelihood]
+    model_options: Dict[str, Any]
     kernel_class: Optional[Type[Kernel]] = None
     _training_data: Optional[TrainingData] = None
     _model: Optional[Model] = None
     # Special setting for surrogates instantiated via `Surrogate.from_BoTorch`,
     # to avoid re-constructing the underlying BoTorch model on `Surrogate.fit`
     # when set to `False`.
-    _should_reconstruct: bool = True
+    _constructed_manually: bool = False
 
     def __init__(
         self,
@@ -67,19 +80,14 @@ class Surrogate(Base):
         # Construction will then be possible from likelihood, kernel, etc.
         botorch_model_class: Type[Model],
         mll_class: Type[MarginalLogLikelihood] = ExactMarginalLogLikelihood,
+        model_options: Optional[Dict[str, Any]] = None,
         kernel_class: Optional[Type[Kernel]] = None,  # TODO: use.
         kernel_options: Optional[Dict[str, Any]] = None,  # TODO: use.
         likelihood: Optional[Type[Likelihood]] = None,  # TODO: use.
     ) -> None:
         self.botorch_model_class = botorch_model_class
         self.mll_class = mll_class
-        # NOTE: assuming here that plugging in kernels will be made easier on the
-        # BoTorch side (for v0 can just always raise `NotImplementedError` if
-        # `kernel` kwarg is not None).
-        if kernel_class:
-            self.kernel_class = kernel_class
-            # NOTE: `validate_kernel_class` to be implemented on BoTorch `Model`.
-            # self.botorch_model_class.validate_kernel_class(kernel_class)
+        self.model_options = model_options or {}
 
         # Temporary validation while we develop these customizations.
         if likelihood is not None:
@@ -90,16 +98,23 @@ class Surrogate(Base):
     @property
     def model(self) -> Model:
         if self._model is None:
-            raise ValueError("BoTorch `Model` has not yet been constructed.")
+            raise ValueError(
+                "BoTorch `Model` has not yet been constructed, please fit the "
+                "surrogate first (done via `BoTorchModel.fit`)."
+            )
         return not_none(self._model)
 
     @property
     def training_data(self) -> TrainingData:
         if self._training_data is None:
-            raise ValueError(
-                "Underlying BoTorch `Model` has not yet received its training_data."
-            )
+            raise ValueError(NOT_YET_FIT_MSG)
         return not_none(self._training_data)
+
+    @property
+    def training_data_per_outcome(self) -> Dict[str, TrainingData]:
+        raise NotImplementedError(  # pragma: no cover
+            "`training_data_per_outcome` is only used in `ListSurrogate`."
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -122,8 +137,11 @@ class Surrogate(Base):
         # pre-made BoTorch `Model` instances to avoid reconstructing models
         # that were likely pre-constructed for a reason (e.g. if this setup
         # doesn't fully allow to constuct them).
-        surrogate._should_reconstruct = False
+        surrogate._constructed_manually = True
         return surrogate
+
+    def clone_reset(self) -> Surrogate:
+        return self.__class__(**self._serialize_attributes_as_kwargs())
 
     def construct(self, training_data: TrainingData, **kwargs: Any) -> None:
         """Constructs the underlying BoTorch `Model` using the training data.
@@ -137,12 +155,13 @@ class Surrogate(Base):
                 - "fidelity_features": Indices of columns in X that represent
                 fidelity.
         """
-        if isabstract(self.botorch_model_class):
-            raise TypeError("Cannot construct an abstract model.")
+        if self._constructed_manually:
+            logger.warning("Reconstructing a manually constructed `Model`.")
         if not isinstance(training_data, TrainingData):
             raise ValueError(  # pragma: no cover
                 "Base `Surrogate` expects training data for single outcome."
             )
+
         kwargs = kwargs or {}
         self._training_data = training_data
 
@@ -150,7 +169,7 @@ class Surrogate(Base):
             training_data=self.training_data,
             fidelity_features=kwargs.get(Keys.FIDELITY_FEATURES),
         )
-        # pyre-ignore[45]: Model isn't abstract per the check above.
+        # pyre-ignore[45]: Py raises informative msg if `model_cls` abstract.
         self._model = self.botorch_model_class(**formatted_model_inputs)
 
     def fit(
@@ -166,12 +185,54 @@ class Surrogate(Base):
         state_dict: Optional[Dict[str, Tensor]] = None,
         refit: bool = True,
     ) -> None:
-        if self._model is None or self._should_reconstruct:
-            self.construct(
-                training_data=training_data, fidelity_features=fidelity_features
+        """Fits the underlying BoTorch `Model` to `m` outcomes.
+
+        NOTE: `state_dict` and `refit` keyword arguments control how the
+        undelying BoTorch `Model` will be fit: whether its parameters will
+        be reoptimized and whether it will be warm-started from a given state.
+        There are three possbilities:
+        1. `fit(state_dict=None)`: fit model from stratch (optimize model
+           parameters and set its training data used for inference),
+        2. `fit(state_dict=some_state_dict, refit=True)`: warm-start refit
+           with a state dict of parameters (still re-optimize model parameters
+           and set the training data),
+        3. `fit(state_dict=some_state_dict, refit=False)`: load model parameters
+           without refitting, but set new training data (used in cross-validation,
+           for example).
+
+        Args:
+            training data: BoTorch `TrainingData` container with Xs, Ys, and
+                possibly Yvars, to be passed to `Model.construct_inputs` in
+                BoTorch.
+            bounds: A list of d (lower, upper) tuples for each column of X.
+            task_features: Columns of X that take integer values and should be
+                treated as task parameters.
+            feature_names: Names of each column of X.
+            metric_names: Names of each outcome Y in Ys.
+            fidelity_features: Columns of X that should be treated as fidelity
+                parameters.
+            candidate_metadata: Model-produced metadata for candidates, in
+                the order corresponding to the Xs.
+            state_dict: Optional state dict to load.
+            refit: Whether to re-optimize model parameters.
+        """
+        if self._constructed_manually:
+            logger.debug(
+                "For manually constructed surrogates (via `Surrogate.from_BoTorch`), "
+                "`fit` skips setting the training data on model and only reoptimizes "
+                "its parameters if `refit=True`."
             )
-        if state_dict is not None:
-            self.model.load_state_dict(state_dict)
+        if self._model is None and not self._constructed_manually:
+            self.construct(
+                training_data=training_data,
+                fidelity_features=fidelity_features,
+                # Kwargs below are unused in base `Surrogate`, but used in subclasses.
+                metric_names=metric_names,
+                task_features=task_features,
+            )
+        if state_dict:
+            self.model.load_state_dict(not_none(state_dict))
+
         if state_dict is None or refit:
             # pyre-ignore[16]: Model has no attribute likelihood.
             # All BoTorch `Model`-s expected to work with this setup have likelihood.
@@ -277,6 +338,67 @@ class Surrogate(Base):
         )
         return candidates[0], acqf_values[0]
 
+    def update(
+        self,
+        training_data: TrainingData,
+        bounds: List[Tuple[float, float]],
+        task_features: List[int],
+        feature_names: List[str],
+        metric_names: List[str],
+        fidelity_features: List[int],
+        target_fidelities: Optional[Dict[int, float]] = None,
+        candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
+        state_dict: Optional[Dict[str, Tensor]] = None,
+        refit: bool = True,
+    ) -> None:
+        """Updates the surrogate model with new data. In the base `Surrogate`,
+        just calls `fit` after checking that this surrogate was not created
+        via `Surrogate.from_BoTorch` (in which case the `Model` comes premade,
+        constructed manually and then supplied to `Surrogate).
+
+        NOTE: Expects `training_data` to be all available data,
+        not just the new data since the last time the model was updated.
+
+        Args:
+            training_data: Surrogate training_data containing all the data the model
+                should use for inference.
+            bounds: A list of d (lower, upper) tuples for each column of X.
+            task_features: Columns of X that take integer values and should be
+                treated as task parameters.
+            feature_names: Names of each column of X.
+            metric_names: Names of each outcome Y in Ys.
+            fidelity_features: Columns of X that should be treated as fidelity
+                parameters.
+            target_fidelities: Target values for fidelity parameters, representing
+                full-fidelity value.
+            candidate_metadata: Model-produced metadata for candidates, in
+                the order corresponding to the Xs.
+            state_dict: Optional state dict to load.
+            refit: Whether to re-optimize model parameters or just set the training
+                data used for interence to new training data.
+        """
+        # NOTE: In the future, could have `incremental` kwarg, in which case
+        # `training_data` could contain just the new data.
+        if self._constructed_manually:
+            raise NotImplementedError(
+                "`update` not yet implemented for models that are "
+                "constructed manually, but it is possible to create a new "
+                "surrogate in the same way as the current manually constructed one, "
+                "via `Surrogate.from_BoTorch`."
+            )
+        self.fit(
+            training_data=training_data,
+            bounds=bounds,
+            task_features=task_features,
+            feature_names=feature_names,
+            metric_names=metric_names,
+            fidelity_features=fidelity_features,
+            target_fidelities=target_fidelities,
+            candidate_metadata=candidate_metadata,
+            state_dict=state_dict,
+            refit=refit,
+        )
+
     def pareto_frontier(self) -> Tuple[Tensor, Tensor]:
         """For multi-objective optimization, retrieve Pareto frontier instead
         of best point.
@@ -290,48 +412,15 @@ class Surrogate(Base):
         )  # pragma: no cover
 
     def compute_diagnostics(self) -> Dict[str, Any]:
-        """Computes model diagnostics like cross-validation measure of fit, etc.
-        """
+        """Computes model diagnostics like cross-validation measure of fit, etc."""
         return {}  # pragma: no cover
 
-    def update(
-        self,
-        training_data: TrainingData,
-        bounds: List[Tuple[float, float]],
-        task_features: List[int],
-        feature_names: List[str],
-        metric_names: List[str],
-        fidelity_features: List[int],
-        candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
-        state_dict: Optional[Dict[str, Tensor]] = None,
-        refit: bool = True,
-    ) -> None:
-        """Updates the surrogate model with new data.
-
-        Args:
-            training_data: Surrogate training_data containing all the data the model
-                should use for inference. NOTE: this should not be just the new data
-                since the last time the model was updated, but all available
-                data.
-            refit: Whether to re-optimize model parameters or just add the new
-                data to data used for inference.
+    def _serialize_attributes_as_kwargs(self) -> Dict[str, Any]:
+        """Serialize attributes of this surrogate, to be passed back to it
+        as kwargs on reinstantiation.
         """
-        # NOTE: In the future, could have `incremental` kwarg, in which case
-        # `training_data` could contain just the new data.
-        state_dict = self.model.state_dict
-        if not self._should_reconstruct:
-            raise NotImplementedError(
-                "`update` not yet implemented for models that should "
-                "not be re-constructed."
-            )
-        self.fit(
-            training_data=training_data,
-            bounds=bounds,
-            task_features=task_features,
-            feature_names=feature_names,
-            metric_names=metric_names,
-            fidelity_features=fidelity_features,
-            candidate_metadata=candidate_metadata,
-            state_dict=state_dict,
-            refit=refit,
-        )
+        return {
+            "botorch_model_class": self.botorch_model_class,
+            "mll_class": self.mll_class,
+            "model_options": self.model_options,
+        }

@@ -73,7 +73,7 @@ class LogY(Transform):
         modelbridge: Optional["base_modelbridge.ModelBridge"],
         fixed_features: ObservationFeatures,
     ) -> OptimizationConfig:
-        for c in optimization_config.outcome_constraints:
+        for c in optimization_config.all_constraints:
             if c.metric.name in self.metric_names:
                 raise ValueError(
                     f"LogY transform cannot be applied to metric {c.metric.name} "
@@ -173,7 +173,7 @@ def norm_to_lognorm(
 
         mu_ln_{i} = exp(mu_n_{i}) + 0.5 * Cov_n_{ii}
         Cov_ln_{ij} = exp(mu_n_{i} + mu_n_{j} + 0.5 * (Cov_n_{ii} + Cov_n_{jj})) *
-            (exp(Cov_n_{ij}) - 1)
+        (exp(Cov_n_{ij}) - 1)
     """
     diag_n = np.diag(Cov_n)
     b = mu_n + 0.5 * diag_n

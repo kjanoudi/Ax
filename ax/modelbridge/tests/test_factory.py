@@ -4,6 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from ax.core.outcome_constraint import ComparisonOp, ObjectiveThreshold
 from ax.core.parameter import RangeParameter
 from ax.modelbridge.discrete import DiscreteModelBridge
 from ax.modelbridge.factory import (
@@ -45,7 +46,7 @@ class ModelBridgeFactoryTest(TestCase):
         self.assertIsInstance(sobol, RandomModelBridge)
         for _ in range(5):
             sobol_run = sobol.gen(n=1)
-            exp.new_batch_trial().add_generator_run(sobol_run).run()
+            exp.new_batch_trial().add_generator_run(sobol_run).run().mark_completed()
         # Check that factory generates a valid GP+EI modelbridge.
         exp.optimization_config = get_branin_optimization_config()
         gpei = get_GPEI(experiment=exp, data=exp.fetch_data())
@@ -73,7 +74,7 @@ class ModelBridgeFactoryTest(TestCase):
             sobol_run = sobol.gen(n=1)
             t = exp.new_batch_trial().add_generator_run(sobol_run)
             t.set_status_quo_with_weight(status_quo=t.arms[0], weight=0.5)
-            t.run()
+            t.run().mark_completed()
         mtgp = get_MTGP(experiment=exp, data=exp.fetch_data(), trial_index=0)
         self.assertIsInstance(mtgp, TorchModelBridge)
 
@@ -85,7 +86,7 @@ class ModelBridgeFactoryTest(TestCase):
         self.assertIsInstance(sobol, RandomModelBridge)
         sobol_run = sobol.gen(n=1)
         t = exp.new_batch_trial().add_generator_run(sobol_run)
-        t.run()
+        t.run().mark_completed()
 
         with self.assertRaises(ValueError):
             get_MTGP(experiment=exp, data=exp.fetch_data(), trial_index=0)
@@ -95,7 +96,7 @@ class ModelBridgeFactoryTest(TestCase):
         exp = get_branin_experiment(with_batch=True)
         with self.assertRaises(ValueError):
             get_GPKG(experiment=exp, data=exp.fetch_data())
-        exp.trials[0].run()
+        exp.trials[0].run().mark_completed()
         gpkg = get_GPKG(experiment=exp, data=exp.fetch_data())
         self.assertIsInstance(gpkg, TorchModelBridge)
 
@@ -161,7 +162,7 @@ class ModelBridgeFactoryTest(TestCase):
         self.assertIsInstance(sobol, RandomModelBridge)
         for _ in range(5):
             sobol_run = sobol.gen(1)
-            exp.new_batch_trial().add_generator_run(sobol_run).run()
+            exp.new_batch_trial().add_generator_run(sobol_run).run().mark_completed()
         with self.assertRaises(TypeError):
             get_sobol(search_space=exp.search_space, nonexistent=True)
 
@@ -179,7 +180,7 @@ class ModelBridgeFactoryTest(TestCase):
         factorial = get_factorial(exp.search_space)
         self.assertIsInstance(factorial, DiscreteModelBridge)
         factorial_run = factorial.gen(n=-1)
-        exp.new_batch_trial().add_generator_run(factorial_run).run()
+        exp.new_batch_trial().add_generator_run(factorial_run).run().mark_completed()
         data = exp.fetch_data()
         eb_thompson = get_empirical_bayes_thompson(
             experiment=exp, data=data, min_weight=0.0
@@ -195,7 +196,7 @@ class ModelBridgeFactoryTest(TestCase):
         factorial = get_factorial(exp.search_space)
         self.assertIsInstance(factorial, DiscreteModelBridge)
         factorial_run = factorial.gen(n=-1)
-        exp.new_batch_trial().add_generator_run(factorial_run).run()
+        exp.new_batch_trial().add_generator_run(factorial_run).run().mark_completed()
         data = exp.fetch_data()
         thompson = get_thompson(experiment=exp, data=data)
         self.assertIsInstance(thompson.model, ThompsonSampler)
@@ -216,7 +217,7 @@ class ModelBridgeFactoryTest(TestCase):
         with self.assertRaises(ValueError):
             get_MOO_RS(experiment=multi_obj_exp, data=multi_obj_exp.fetch_data())
 
-        multi_obj_exp.trials[0].run()
+        multi_obj_exp.trials[0].run().mark_completed()
         moo_rs = get_MOO_RS(experiment=multi_obj_exp, data=multi_obj_exp.fetch_data())
         self.assertIsInstance(moo_rs, MultiObjectiveTorchModelBridge)
         self.assertEqual(
@@ -240,7 +241,7 @@ class ModelBridgeFactoryTest(TestCase):
         with self.assertRaises(ValueError):
             get_MOO_PAREGO(experiment=multi_obj_exp, data=multi_obj_exp.fetch_data())
 
-        multi_obj_exp.trials[0].run()
+        multi_obj_exp.trials[0].run().mark_completed()
         moo_parego = get_MOO_PAREGO(
             experiment=multi_obj_exp, data=multi_obj_exp.fetch_data()
         )
@@ -259,26 +260,39 @@ class ModelBridgeFactoryTest(TestCase):
 
     def test_MOO_EHVI(self):
         single_obj_exp = get_branin_experiment(with_batch=True)
+        metrics = single_obj_exp.optimization_config.objective.metrics
+        metrics[0].lower_is_better = True
+        objective_thresholds = [
+            ObjectiveThreshold(
+                metric=metrics[0], bound=0.0, relative=False, op=ComparisonOp.GEQ
+            )
+        ]
         with self.assertRaises(ValueError):
             get_MOO_EHVI(
                 experiment=single_obj_exp,
                 data=single_obj_exp.fetch_data(),
-                ref_point=[0, 0],
+                objective_thresholds=objective_thresholds,
             )
         multi_obj_exp = get_branin_experiment_with_multi_objective(with_batch=True)
         metrics = multi_obj_exp.optimization_config.objective.metrics
+        metrics[0].lower_is_better = False
+        metrics[1].lower_is_better = True
+        multi_objective_thresholds = [
+            ObjectiveThreshold(metric=metrics[0], bound=0.0, relative=False),
+            ObjectiveThreshold(metric=metrics[1], bound=0.0, relative=False),
+        ]
         with self.assertRaises(ValueError):
             get_MOO_EHVI(
                 experiment=multi_obj_exp,
                 data=multi_obj_exp.fetch_data(),
-                ref_point={metrics[0].name: 0.0, metrics[1].name: 0.0},
+                objective_thresholds=multi_objective_thresholds,
             )
 
-        multi_obj_exp.trials[0].run()
+        multi_obj_exp.trials[0].run().mark_completed()
         moo_ehvi = get_MOO_EHVI(
             experiment=multi_obj_exp,
             data=multi_obj_exp.fetch_data(),
-            ref_point={metrics[0].name: 0.0, metrics[1].name: 0.0},
+            objective_thresholds=multi_objective_thresholds,
         )
         self.assertIsInstance(moo_ehvi, MultiObjectiveTorchModelBridge)
         moo_ehvi_run = moo_ehvi.gen(n=1)

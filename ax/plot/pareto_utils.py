@@ -14,7 +14,7 @@ from ax.core.experiment import Experiment
 from ax.core.metric import Metric
 from ax.core.objective import ScalarizedObjective
 from ax.core.observation import ObservationFeatures
-from ax.core.optimization_config import OptimizationConfig
+from ax.core.optimization_config import MultiObjectiveOptimizationConfig
 from ax.core.outcome_constraint import OutcomeConstraint
 from ax.core.types import TParameterization
 from ax.exceptions.core import AxError, UnsupportedError
@@ -70,7 +70,7 @@ def compute_pareto_frontier(
     chebyshev: bool = True,
 ) -> ParetoFrontierResults:
     """Compute the Pareto frontier between two objectives. For experiments
-    with batch trials, a trial index must be provided.
+    with batch trials, a trial index or data object must be provided.
 
     Args:
         experiment: The experiment to compute a pareto frontier for.
@@ -102,15 +102,18 @@ def compute_pareto_frontier(
                 are NOT be relativized w.r.t. the status quo (all other metrics
                 are in % relative to status_quo).
     """
+    # TODO(jej): Implement using MultiObjectiveTorchModelBridge's _pareto_frontier
     model_gen_options = {
         "acquisition_function_kwargs": {"chebyshev_scalarization": chebyshev}
     }
 
-    if trial_index is None and any(
-        isinstance(t, BatchTrial) for t in experiment.trials.values()
+    if (
+        trial_index is None
+        and data is None
+        and any(isinstance(t, BatchTrial) for t in experiment.trials.values())
     ):
         raise UnsupportedError(
-            "Must specify trial index for experiment with batch trials"
+            "Must specify trial index or data for experiment with batch trials"
         )
     absolute_metrics = [] if absolute_metrics is None else absolute_metrics
     for metric in absolute_metrics:
@@ -138,8 +141,17 @@ def compute_pareto_frontier(
         except Exception as e:
             logger.info(f"Could not fetch data from experiment or trial: {e}")
 
+    oc = _build_new_optimization_config(
+        weights=np.array([0.5, 0.5]),
+        primary_objective=primary_objective,
+        secondary_objective=secondary_objective,
+        outcome_constraints=outcome_constraints,
+    )
     model = Models.MOO(
-        experiment=experiment, data=data, acqf_constructor=get_PosteriorMean
+        experiment=experiment,
+        data=data,
+        acqf_constructor=get_PosteriorMean,
+        optimization_config=oc,
     )
 
     status_quo = experiment.status_quo
@@ -271,7 +283,7 @@ def _build_new_optimization_config(
         weights=weights,
         minimize=False,
     )
-    optimization_config = OptimizationConfig(
+    optimization_config = MultiObjectiveOptimizationConfig(
         objective=obj, outcome_constraints=outcome_constraints
     )
     return optimization_config

@@ -11,7 +11,7 @@ import numpy as np
 from ax.core.observation import Observation, ObservationData
 from ax.modelbridge.base import ModelBridge
 from ax.utils.common.logger import get_logger
-from scipy.stats import fisher_exact, pearsonr, spearmanr
+from scipy.stats import fisher_exact, pearsonr, spearmanr, norm
 
 
 logger = get_logger(__name__)
@@ -23,6 +23,7 @@ TOTAL_RAW_EFFECT = "Total raw effect"
 CORRELATION_COEFFICIENT = "Correlation coefficient"
 RANK_CORRELATION = "Rank correlation"
 FISHER_EXACT_TEST_P = "Fisher exact test p"
+LOG_LIKELIHOOD = "Log likelihood"
 
 
 class CVResult(NamedTuple):
@@ -55,7 +56,7 @@ def cross_validate(
         model: Fitted model (ModelBridge) to cross validate.
         folds: Number of folds. Use -1 for leave-one-out, otherwise will be
             k-fold.
-        test_select: Function for selecting observations for the test set.
+        test_selector: Function for selecting observations for the test set.
 
     Returns:
         A CVResult for each observation in the training data.
@@ -144,8 +145,8 @@ def cross_validate_by_trial(model: ModelBridge, trial: int = -1) -> List[CVResul
     for obs in training_data:
         if obs.features.trial_index is None:
             continue
-        # pyre-fixme[6]: `<` is not supported for operand types `Optional[np.int64]`
-        #  and `int`.
+        # pyre-fixme[58]: `<` is not supported for operand types
+        #  `Optional[np.int64]` and `int`.
         elif obs.features.trial_index < trial:
             cv_training_data.append(obs)
         elif obs.features.trial_index == trial:
@@ -214,6 +215,7 @@ def compute_diagnostics(result: List[CVResult]) -> Dict[str, Dict[str, float]]:
         CORRELATION_COEFFICIENT: _correlation_coefficient,
         RANK_CORRELATION: _rank_correlation,
         FISHER_EXACT_TEST_P: _fisher_exact_test_p,
+        LOG_LIKELIHOOD: _log_likelihood,
     }
 
     diagnostics: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -290,6 +292,13 @@ def _mean_prediction_ci(
 ) -> float:
     # Pyre does not allow float * np.ndarray.
     return float(np.mean(1.96 * 2 * se_pred / np.abs(y_obs)))
+
+
+def _log_likelihood(
+    y_obs: np.ndarray, y_pred: np.ndarray, se_pred: np.ndarray
+) -> float:
+    # pyre-ignore [16]
+    return float(np.sum(norm.logpdf(y_obs, loc=y_pred, scale=se_pred)))
 
 
 def _mape(y_obs: np.ndarray, y_pred: np.ndarray, se_pred: np.ndarray) -> float:

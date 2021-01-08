@@ -45,7 +45,7 @@ from ax.models.random.uniform import UniformGenerator
 from ax.models.torch.botorch import BotorchModel
 from ax.models.torch.botorch_kg import KnowledgeGradient
 from ax.models.torch.botorch_mes import MaxValueEntropySearch
-from ax.models.torch.botorch_modular.model import BoTorchModel
+from ax.models.torch.botorch_modular.model import BoTorchModel as ModularBoTorchModel
 from ax.models.torch.botorch_moo import MultiObjectiveBotorchModel
 from ax.utils.common.kwargs import (
     consolidate_kwargs,
@@ -106,14 +106,13 @@ ST_MTGP_trans: List[Type[Transform]] = Cont_X_trans + [
 ]
 
 # Single-type MTGP transforms
-Specified_Task_ST_MTGP_trans: List[Type[Transform]] = (
-    Cont_X_trans + [Derelativize, StratifiedStandardizeY, TaskEncode]
-)
+Specified_Task_ST_MTGP_trans: List[Type[Transform]] = Cont_X_trans + [
+    Derelativize,
+    StratifiedStandardizeY,
+    TaskEncode,
+]
 
-STANDARD_TORCH_BRIDGE_KWARGS: Dict[str, Any] = {
-    "torch_dtype": torch.double,
-    "torch_device": torch.device("cpu"),
-}
+STANDARD_TORCH_BRIDGE_KWARGS: Dict[str, Any] = {"torch_dtype": torch.double}
 
 
 class ModelSetup(NamedTuple):
@@ -143,7 +142,7 @@ MODEL_KEY_TO_MODEL_SETUP: Dict[str, ModelSetup] = {
     ),
     "BoTorch": ModelSetup(
         bridge_class=TorchModelBridge,
-        model_class=BoTorchModel,
+        model_class=ModularBoTorchModel,
         transforms=Cont_X_trans + Y_trans,
         standard_bridge_kwargs=STANDARD_TORCH_BRIDGE_KWARGS,
     ),
@@ -199,34 +198,10 @@ MODEL_KEY_TO_MODEL_SETUP: Dict[str, ModelSetup] = {
 }
 
 
-class Models(Enum):
-    """Registry of available models.
-
-    Uses MODEL_KEY_TO_MODEL_SETUP to retrieve settings for model and model bridge,
-    by the key stored in the enum value.
-
-    To instantiate a model in this enum, simply call an enum member like so:
-    `Models.SOBOL(search_space=search_space)` or
-    `Models.GPEI(experiment=experiment, data=data)`. Keyword arguments
-    specified to the call will be passed into the model or the model bridge
-    constructors according to their keyword.
-
-    For instance, `Models.SOBOL(search_space=search_space, scramble=False)`
-    will instantiate a `RandomModelBridge(search_space=search_space)`
-    with a `SobolGenerator(scramble=False)` underlying model.
+class ModelRegistryBase(Enum):
+    """Base enum that provides instrumentation of `__call__` on enum values,
+    for enums that link their values to `ModelSetup`-s like `Models`.
     """
-
-    SOBOL = "Sobol"
-    GPEI = "GPEI"
-    GPKG = "GPKG"
-    GPMES = "GPMES"
-    FACTORIAL = "Factorial"
-    THOMPSON = "Thompson"
-    BOTORCH = "BO"
-    BOTORCH_MODULAR = "BoTorch"
-    EMPIRICAL_BAYES_THOMPSON = "EB"
-    UNIFORM = "Uniform"
-    MOO = "MOO"
 
     @property
     def model_class(self) -> Type[Model]:
@@ -238,23 +213,23 @@ class Models(Enum):
         """Type of `ModelBridge` used for the given model+bridge setup."""
         return MODEL_KEY_TO_MODEL_SETUP[self.value].bridge_class
 
-    # TODO[T67370152]: Test that none of the `ModelSetup`-s share a kwarg.
     def __call__(
         self,
         search_space: Optional[SearchSpace] = None,
         experiment: Optional[Experiment] = None,
         data: Optional[Data] = None,
-        silently_filter_kwargs: bool = True,  # TODO[Lena]: default to False
+        silently_filter_kwargs: bool = False,
         **kwargs: Any,
     ) -> ModelBridge:
         assert self.value in MODEL_KEY_TO_MODEL_SETUP, f"Unknown model {self.value}"
         # All model bridges require either a search space or an experiment.
         assert search_space or experiment, "Search space or experiment required."
+        search_space = search_space or not_none(experiment).search_space
         model_setup_info = MODEL_KEY_TO_MODEL_SETUP[self.value]
         model_class = model_setup_info.model_class
         bridge_class = model_setup_info.bridge_class
         if not silently_filter_kwargs:
-            validate_kwarg_typing(  # TODO[Lena]: T46467254, pragma: no cover
+            validate_kwarg_typing(
                 typed_callables=[model_class, bridge_class],
                 search_space=search_space,
                 experiment=experiment,
@@ -357,11 +332,41 @@ class Models(Enum):
         )
 
 
+class Models(ModelRegistryBase):
+    """Registry of available models.
+
+    Uses MODEL_KEY_TO_MODEL_SETUP to retrieve settings for model and model bridge,
+    by the key stored in the enum value.
+
+    To instantiate a model in this enum, simply call an enum member like so:
+    `Models.SOBOL(search_space=search_space)` or
+    `Models.GPEI(experiment=experiment, data=data)`. Keyword arguments
+    specified to the call will be passed into the model or the model bridge
+    constructors according to their keyword.
+
+    For instance, `Models.SOBOL(search_space=search_space, scramble=False)`
+    will instantiate a `RandomModelBridge(search_space=search_space)`
+    with a `SobolGenerator(scramble=False)` underlying model.
+    """
+
+    SOBOL = "Sobol"
+    GPEI = "GPEI"
+    GPKG = "GPKG"
+    GPMES = "GPMES"
+    FACTORIAL = "Factorial"
+    THOMPSON = "Thompson"
+    BOTORCH = "BO"
+    BOTORCH_MODULAR = "BoTorch"
+    EMPIRICAL_BAYES_THOMPSON = "EB"
+    UNIFORM = "Uniform"
+    MOO = "MOO"
+
+
 def get_model_from_generator_run(
     generator_run: GeneratorRun,
     experiment: Experiment,
     data: Data,
-    models_enum: Optional[Type[Models]] = None,
+    models_enum: Optional[Type[ModelRegistryBase]] = None,
     after_gen: bool = True,
 ) -> ModelBridge:
     """Reinstantiate a model from model key and kwargs stored on a given generator

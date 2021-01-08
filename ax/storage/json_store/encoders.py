@@ -17,7 +17,10 @@ from ax.core.generator_run import GeneratorRun
 from ax.core.metric import Metric
 from ax.core.multi_type_experiment import MultiTypeExperiment
 from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
-from ax.core.optimization_config import OptimizationConfig
+from ax.core.optimization_config import (
+    MultiObjectiveOptimizationConfig,
+    OptimizationConfig,
+)
 from ax.core.outcome_constraint import OutcomeConstraint
 from ax.core.parameter import ChoiceParameter, FixedParameter, RangeParameter
 from ax.core.parameter_constraint import (
@@ -277,6 +280,18 @@ def optimization_config_to_dict(
     }
 
 
+def multi_objective_optimization_config_to_dict(
+    multi_objective_optimization_config: MultiObjectiveOptimizationConfig,
+) -> Dict[str, Any]:
+    """Convert Ax optimization config to a dictionary."""
+    return {
+        "__type": multi_objective_optimization_config.__class__.__name__,
+        "objective": multi_objective_optimization_config.objective,
+        "outcome_constraints": multi_objective_optimization_config.outcome_constraints,
+        "objective_thresholds": multi_objective_optimization_config.objective_thresholds,  # noqa E501
+    }
+
+
 def generator_run_to_dict(generator_run: GeneratorRun) -> Dict[str, Any]:
     """Convert Ax generator run to a dictionary."""
     gr = generator_run
@@ -418,24 +433,21 @@ def botorch_model_to_dict(model: BoTorchModel) -> Dict[str, Any]:
     return {
         "__type": model.__class__.__name__,
         "surrogate": model.surrogate,
-        "surrogate_fit_options": model.surrogate_fit_options,
+        "surrogate_options": model.surrogate_options,
         "acquisition_class": model.acquisition_class,
         "botorch_acqf_class": model.botorch_acqf_class,
         "acquisition_options": model.acquisition_options or {},
+        "refit_on_update": model.refit_on_update,
+        "refit_on_cv": model.refit_on_cv,
+        "warm_start_refit": model.warm_start_refit,
     }
 
 
 def surrogate_to_dict(surrogate: Surrogate) -> Dict[str, Any]:
     """Convert Ax surrogate to a dictionary."""
-    return {
-        "__type": surrogate.__class__.__name__,
-        "botorch_model_class": surrogate.botorch_model_class,
-        "mll_class": surrogate.mll_class,
-        # TODO: Add these once they are implemented.
-        # "kernel_class": surrogate.kernel_class,
-        # "kernel_options": surrogate.kernel_options or {},
-        # "likelihood": surrogate.likelihood,
-    }
+    dict_representation = {"__type": surrogate.__class__.__name__}
+    dict_representation.update(surrogate._serialize_attributes_as_kwargs())
+    return dict_representation
 
 
 def botorch_modular_to_dict(class_type: Type[Any]) -> Dict[str, Any]:
@@ -443,6 +455,12 @@ def botorch_modular_to_dict(class_type: Type[Any]) -> Dict[str, Any]:
     for _class in CLASS_TO_REGISTRY:
         if issubclass(class_type, _class):
             registry = CLASS_TO_REGISTRY[_class]
+            if class_type not in registry:
+                raise ValueError(  # pragma: no cover
+                    f"Class `{class_type.__name__}` not in Type[{_class.__name__}] "
+                    "registry, please add it. BoTorch object registries are "
+                    "located in `ax/storage/botorch_modular_registry.py`."
+                )
             return {
                 "__type": f"Type[{_class.__name__}]",
                 "index": registry[class_type],

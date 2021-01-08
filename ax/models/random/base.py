@@ -32,9 +32,9 @@ class RandomModel(Model):
     `_gen_unconstrained`/`gen` can be directly implemented.
 
     Attributes:
-        deduplicate: If specified, a single instantiation of the model
-            will not return the same point twice. This flag is used in
-            rejection sampling.
+        deduplicate: If True (defaults to True), a single instantiation
+            of the model will not return the same point twice. This flag
+            is used in rejection sampling.
         scramble: If True, permutes the parameter values among
             the elements of the Sobol sequence. Default is True.
         seed: An optional seed value for scrambling.
@@ -42,7 +42,7 @@ class RandomModel(Model):
 
     def __init__(
         self,
-        deduplicate: bool = False,
+        deduplicate: bool = True,
         seed: Optional[int] = None,
         generated_points: Optional[np.ndarray] = None,
     ) -> None:
@@ -102,6 +102,7 @@ class RandomModel(Model):
                 #  for 1st param but got
                 #  `Union[botorch.acquisition.acquisition.AcquisitionFunction, float,
                 #  int, str]`.
+                # pyre-fixme[35]: Target cannot be annotated.
                 max_draws: int = int(max_draws)
         # Always rejection sample, but this only rejects if there are
         # constraints or actual duplicates and deduplicate is specified.
@@ -128,9 +129,6 @@ class RandomModel(Model):
                 self.generated_points = np.vstack([self.generated_points, points])
         return (points, np.ones(len(points)))
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Expected `Model` for 1st param but got
-    #  `(self: RandomModel) -> Dict[str, typing.Any]`.
     @copy_doc(Model._get_state)
     def _get_state(self) -> Dict[str, Any]:
         state = super()._get_state()

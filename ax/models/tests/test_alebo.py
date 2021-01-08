@@ -121,13 +121,15 @@ class ALEBOTest(TestCase):
         # Test extract_map_statedict
         map_sds = extract_map_statedict(m_b=m_b, num_outputs=1)
         self.assertEqual(len(map_sds), 1)
-        self.assertEqual(len(map_sds[0]), 3)
+        self.assertEqual(len(map_sds[0]), 5)
         self.assertEqual(
             set(map_sds[0]),
             {
                 "covar_module.base_kernel.Uvec",
                 "covar_module.raw_outputscale",
                 "mean_module.constant",
+                "covar_module.raw_outputscale_constraint.lower_bound",
+                "covar_module.raw_outputscale_constraint.upper_bound",
             },
         )
         self.assertEqual(
@@ -138,13 +140,15 @@ class ALEBOTest(TestCase):
         map_sds = extract_map_statedict(m_b=ml, num_outputs=2)
         self.assertEqual(len(map_sds), 2)
         for i in range(2):
-            self.assertEqual(len(map_sds[i]), 3)
+            self.assertEqual(len(map_sds[i]), 5)
             self.assertEqual(
                 set(map_sds[i]),
                 {
                     "covar_module.base_kernel.Uvec",
                     "covar_module.raw_outputscale",
                     "mean_module.constant",
+                    "covar_module.raw_outputscale_constraint.lower_bound",
+                    "covar_module.raw_outputscale_constraint.upper_bound",
                 },
             )
             self.assertEqual(
@@ -185,6 +189,26 @@ class ALEBOTest(TestCase):
             noiseless=True,
         )
         self.assertEqual(acq.best_f.item(), 1.0)
+        with mock.patch(
+            "ax.models.torch.alebo.optimize_acqf",
+            autospec=True,
+            return_value=(train_X, train_Y),
+        ) as optim_mock:
+            alebo_acqf_optimizer(
+                acq_function=acq,
+                bounds=None,
+                n=1,
+                inequality_constraints=5.0,
+                fixed_features=None,
+                rounding_func=None,
+                raw_samples=100,
+                num_restarts=5,
+                B=B,
+            )
+        self.assertEqual(optim_mock.call_count, 1)
+        self.assertIsInstance(
+            optim_mock.mock_calls[0][2]["acq_function"], ExpectedImprovement
+        )
 
         acq = ei_or_nei(
             model=m,

@@ -5,9 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections import OrderedDict
-from unittest.mock import patch
 
-from ax.core.observation import Observation
 from ax.modelbridge.discrete import DiscreteModelBridge
 from ax.modelbridge.random import RandomModelBridge
 from ax.modelbridge.registry import (
@@ -34,7 +32,7 @@ from ax.utils.testing.core_stubs import (
 )
 from botorch.acquisition.monte_carlo import qExpectedImprovement
 from botorch.models.gp_regression import FixedNoiseGP
-from torch import device as torch_device, float64 as torch_float64
+from torch import float64 as torch_float64
 
 
 class ModelRegistryTest(TestCase):
@@ -102,6 +100,8 @@ class ModelRegistryTest(TestCase):
                 "refit_on_cv": False,
                 "refit_on_update": True,
                 "warm_start_refitting": True,
+                "use_input_warping": False,
+                "use_loocv_pseudo_likelihood": False,
             },
         )
         self.assertEqual(
@@ -109,7 +109,7 @@ class ModelRegistryTest(TestCase):
             {
                 "transform_configs": None,
                 "torch_dtype": torch_float64,
-                "torch_device": torch_device(type="cpu"),
+                "torch_device": None,
                 "status_quo_name": None,
                 "status_quo_features": None,
                 "optimization_config": None,
@@ -149,7 +149,7 @@ class ModelRegistryTest(TestCase):
         factorial = Models.FACTORIAL(exp.search_space)
         self.assertIsInstance(factorial, DiscreteModelBridge)
         factorial_run = factorial.gen(n=-1)
-        exp.new_batch_trial().add_generator_run(factorial_run).run()
+        exp.new_batch_trial().add_generator_run(factorial_run).run().mark_completed()
         data = exp.fetch_data()
         eb_thompson = Models.EMPIRICAL_BAYES_THOMPSON(
             experiment=exp, data=data, min_weight=0.0
@@ -165,7 +165,7 @@ class ModelRegistryTest(TestCase):
         factorial = Models.FACTORIAL(exp.search_space)
         self.assertIsInstance(factorial, DiscreteModelBridge)
         factorial_run = factorial.gen(n=-1)
-        exp.new_batch_trial().add_generator_run(factorial_run).run()
+        exp.new_batch_trial().add_generator_run(factorial_run).run().mark_completed()
         data = exp.fetch_data()
         thompson = Models.THOMPSON(experiment=exp, data=data)
         self.assertIsInstance(thompson.model, ThompsonSampler)
@@ -222,10 +222,7 @@ class ModelRegistryTest(TestCase):
             ),
         )
 
-    @patch(
-        f"{Observation.__module__}.current_timestamp_in_millis", return_value=123456789
-    )
-    def test_get_model_from_generator_run(self, _):
+    def test_get_model_from_generator_run(self):
         """Tests that it is possible to restore a model from a generator run it
         produced, if `Models` registry was used.
         """
@@ -249,10 +246,11 @@ class ModelRegistryTest(TestCase):
         # Check restoration of GPEI, to ensure proper restoration of callable kwargs
         gpei = Models.GPEI(experiment=exp, data=get_branin_data())
         # Punch GPEI model + bridge kwargs into the Sobol generator run, to avoid
-        # a slow call to `gpei.gen`.
+        # a slow call to `gpei.gen`, and remove Sobol's model state.
         gr._model_key = "GPEI"
         gr._model_kwargs = gpei._model_kwargs
         gr._bridge_kwargs = gpei._bridge_kwargs
+        gr._model_state_after_gen = {}
         gpei_restored = get_model_from_generator_run(
             gr, experiment=exp, data=get_branin_data()
         )

@@ -12,12 +12,12 @@ from ax.core.parameter import ChoiceParameter, FixedParameter
 from ax.core.search_space import SearchSpace
 from ax.core.types import TConfig, TGenMetadata, TParamValueList
 from ax.modelbridge.array import (
-    array_to_observation_data,
     extract_objective_weights,
     extract_outcome_constraints,
     validate_optimization_config,
 )
 from ax.modelbridge.base import ModelBridge
+from ax.modelbridge.modelbridge_utils import array_to_observation_data
 from ax.models.discrete_base import DiscreteModel
 
 
@@ -162,6 +162,7 @@ class DiscreteModelBridge(ModelBridge):
 
     def _cross_validate(
         self,
+        search_space: SearchSpace,
         obs_feats: List[ObservationFeatures],
         obs_data: List[ObservationData],
         cv_test_points: List[ObservationFeatures],
@@ -213,8 +214,7 @@ def _convert_observations(
 def _get_parameter_values(
     search_space: SearchSpace, param_names: List[str]
 ) -> List[TParamValueList]:
-    """Extract parameter values from a search space of discrete parameters.
-    """
+    """Extract parameter values from a search space of discrete parameters."""
     parameter_values: List[TParamValueList] = []
     for p_name in param_names:
         p = search_space.parameters[p_name]

@@ -4,21 +4,30 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-strict
-
 from itertools import groupby
 from typing import Dict, List, Optional
 
 from ax.core.metric import Metric
-from ax.core.objective import Objective
-from ax.core.outcome_constraint import OutcomeConstraint
-from ax.core.types import ComparisonOp
-from ax.utils.common.equality import Base
+from ax.core.objective import MultiObjective, Objective
+from ax.core.outcome_constraint import (
+    ComparisonOp,
+    ObjectiveThreshold,
+    OutcomeConstraint,
+)
+from ax.utils.common.base import Base
+from ax.utils.common.logger import get_logger
 
 
-MAX_OBJECTIVES: int = 4
+logger = get_logger(__name__)
+
+TRefPoint = List[ObjectiveThreshold]
+
 OC_TEMPLATE: str = (
     "OptimizationConfig(objective={objective}, outcome_constraints=[{constraints}])"
+)
+MOOC_TEMPLATE: str = (
+    "OptimizationConfig(objective={objective}, outcome_constraints=[{constraints}], "
+    "objective_thresholds=[{thresholds}])"
 )
 
 
@@ -42,9 +51,9 @@ class OptimizationConfig(Base):
             objective: Metric+direction to use for the optimization.
             outcome_constraints: Constraints on metrics.
         """
-        constraints: List[
-            OutcomeConstraint
-        ] = [] if outcome_constraints is None else outcome_constraints
+        constraints: List[OutcomeConstraint] = (
+            [] if outcome_constraints is None else outcome_constraints
+        )
         self._validate_optimization_config(
             objective=objective, outcome_constraints=constraints
         )
@@ -53,9 +62,20 @@ class OptimizationConfig(Base):
 
     def clone(self) -> "OptimizationConfig":
         """Make a copy of this optimization config."""
+        return self.clone_with_args()
+
+    def clone_with_args(
+        self,
+        objective: Optional[Objective] = None,
+        outcome_constraints: Optional[List[OutcomeConstraint]] = None,
+    ) -> "OptimizationConfig":
+        """Make a copy of this optimization config."""
+        objective = objective or self.objective.clone()
+        outcome_constraints = outcome_constraints or [
+            constraint.clone() for constraint in self.outcome_constraints
+        ]
         return OptimizationConfig(
-            self.objective.clone(),
-            [constraint.clone() for constraint in self.outcome_constraints],
+            objective=objective, outcome_constraints=outcome_constraints
         )
 
     @property
@@ -68,6 +88,11 @@ class OptimizationConfig(Base):
         """Set objective if not present in outcome constraints."""
         self._validate_optimization_config(objective, self.outcome_constraints)
         self._objective = objective
+
+    @property
+    def all_constraints(self) -> List[OutcomeConstraint]:
+        """Get outcome constraints."""
+        return self.outcome_constraints
 
     @property
     def outcome_constraints(self) -> List[OutcomeConstraint]:
@@ -92,7 +117,8 @@ class OptimizationConfig(Base):
 
     @staticmethod
     def _validate_optimization_config(
-        objective: Objective, outcome_constraints: List[OutcomeConstraint]
+        objective: Objective,
+        outcome_constraints: Optional[List[OutcomeConstraint]] = None,
     ) -> None:
         """Ensure outcome constraints are valid.
 
@@ -105,10 +131,29 @@ class OptimizationConfig(Base):
         Args:
             outcome_constraints: Constraints to validate.
         """
+        if type(objective) == MultiObjective:
+            # Raise error on exact equality; scalarizedObjective is OK
+            raise ValueError(
+                (
+                    "OptimizationConfig does not support MultiObjective. "
+                    "Use MultiObjectiveOptimizationConfig instead."
+                )
+            )
+        outcome_constraints = outcome_constraints or []
+        unconstrainable_metrics = objective.get_unconstrainable_metrics()
+        OptimizationConfig._validate_outcome_constraints(
+            unconstrainable_metrics=unconstrainable_metrics,
+            outcome_constraints=outcome_constraints,
+        )
+
+    @staticmethod
+    def _validate_outcome_constraints(
+        unconstrainable_metrics: List[Metric],
+        outcome_constraints: List[OutcomeConstraint],
+    ) -> None:
         constraint_metrics = [
             constraint.metric.name for constraint in outcome_constraints
         ]
-        unconstrainable_metrics = objective.get_unconstrainable_metrics()
         for metric in unconstrainable_metrics:
             if metric.name in constraint_metrics:
                 raise ValueError("Cannot constrain on objective metric.")
@@ -144,3 +189,184 @@ class OptimizationConfig(Base):
                 constraint.__repr__() for constraint in self.outcome_constraints
             ),
         )
+
+
+class MultiObjectiveOptimizationConfig(OptimizationConfig):
+    """An optimization configuration for multi-objective optimization,
+    which comprises multiple objective, outcome constraints, and objective
+    thresholds.
+
+    There is no minimum or maximum number of outcome constraints, but an
+    individual metric can have at most two constraints--which is how we
+    represent metrics with both upper and lower bounds.
+
+    ObjectiveThresholds should be present for every objective. A good
+    rule of thumb is to set them 10% below the minimum acceptable value
+    for each metric.
+    """
+
+    def __init__(
+        self,
+        objective: Objective,
+        outcome_constraints: Optional[List[OutcomeConstraint]] = None,
+        objective_thresholds: Optional[List[ObjectiveThreshold]] = None,
+    ) -> None:
+        """Inits OptimizationConfig.
+
+        Args:
+            objective: Metric+direction to use for the optimization.
+            outcome_constraints: Constraints on metrics.
+            objective_thesholds: Thresholds objectives must exceed. Used for
+                multi-objective optimization and for calculating frontiers
+                and hypervolumes.
+        """
+        constraints: List[OutcomeConstraint] = (
+            [] if outcome_constraints is None else outcome_constraints
+        )
+        objective_thresholds = objective_thresholds or []
+        self._validate_optimization_config(
+            objective=objective,
+            outcome_constraints=constraints,
+            objective_thresholds=objective_thresholds,
+        )
+        self._objective: Objective = objective
+        self._outcome_constraints: List[OutcomeConstraint] = constraints
+        self._objective_thresholds: List[ObjectiveThreshold] = objective_thresholds
+
+    def clone_with_args(
+        self,
+        objective: Optional[Objective] = None,
+        outcome_constraints: Optional[List[OutcomeConstraint]] = None,
+        objective_thresholds: Optional[List[ObjectiveThreshold]] = None,
+    ) -> "MultiObjectiveOptimizationConfig":
+        """Make a copy of this optimization config."""
+        objective = objective or self.objective.clone()
+        outcome_constraints = outcome_constraints or [
+            constraint.clone() for constraint in self.outcome_constraints
+        ]
+        objective_thresholds = objective_thresholds or [
+            ot.clone() for ot in self.objective_thresholds
+        ]
+        return MultiObjectiveOptimizationConfig(
+            objective=objective,
+            outcome_constraints=outcome_constraints,
+            objective_thresholds=objective_thresholds,
+        )
+
+    @property
+    def objective(self) -> Objective:
+        """Get objective."""
+        return self._objective
+
+    @objective.setter
+    def objective(self, objective: Objective) -> None:
+        """Set objective if not present in outcome constraints."""
+        self._validate_optimization_config(
+            objective=objective,
+            outcome_constraints=self.outcome_constraints,
+            objective_thresholds=self.objective_thresholds,
+        )
+        self._objective = objective
+
+    @property
+    def all_constraints(self) -> List[OutcomeConstraint]:
+        """Get all constraints and thresholds."""
+        # pyre-ignore[58]: `+` not supported for Lists of different types.
+        return self.outcome_constraints + self.objective_thresholds
+
+    @property
+    def metrics(self) -> Dict[str, Metric]:
+        constraint_metrics = {oc.metric.name: oc.metric for oc in self.all_constraints}
+        objective_metrics = {metric.name: metric for metric in self.objective.metrics}
+        return {**constraint_metrics, **objective_metrics}
+
+    @property
+    def objective_thresholds(self) -> List[ObjectiveThreshold]:
+        """Get objective thresholds."""
+        return self._objective_thresholds
+
+    @objective_thresholds.setter
+    def objective_thresholds(
+        self, objective_thresholds: List[ObjectiveThreshold]
+    ) -> None:
+        """Set outcome constraints if valid, else raise."""
+        self._validate_optimization_config(
+            objective=self.objective, objective_thresholds=objective_thresholds
+        )
+        self._objective_thresholds = objective_thresholds
+
+    @staticmethod
+    def _validate_optimization_config(
+        objective: Objective,
+        outcome_constraints: Optional[List[OutcomeConstraint]] = None,
+        objective_thresholds: Optional[List[ObjectiveThreshold]] = None,
+    ) -> None:
+        """Ensure outcome constraints are valid.
+
+        Either one or two outcome constraints can reference one metric.
+        If there are two constraints, they must have different 'ops': one
+            LEQ and one GEQ.
+        If there are two constraints, the bound of the GEQ op must be less
+            than the bound of the LEQ op.
+
+        Args:
+            outcome_constraints: Constraints to validate.
+        """
+        if not isinstance(objective, MultiObjective):
+            raise TypeError(
+                (
+                    "`MultiObjectiveOptimizationConfig` requires an objective "
+                    "of type `MultiObjective`. Use `OptimizationConfig` instead "
+                    "if using a single-metric objective."
+                )
+            )
+        outcome_constraints = outcome_constraints or []
+        objective_thresholds = objective_thresholds or []
+
+        # Verify we aren't optimizing too many objectives.
+        objective_metrics_by_name = {
+            metric.name: metric for metric in objective.metrics
+        }
+        # Warn if thresholds on objective_metrics bound from the wrong direction.
+        for threshold in objective_thresholds:
+            metric_name = threshold.metric.name
+            if metric_name in objective_metrics_by_name:
+                lower_is_better = threshold.metric.lower_is_better
+                bounded_above = threshold.op == ComparisonOp.LEQ
+                is_aligned = lower_is_better == bounded_above
+                if not (is_aligned or lower_is_better is None):
+                    raise ValueError(
+                        make_wrong_direction_warning(
+                            metric_name=metric_name,
+                            bounded_above=bounded_above,
+                            lower_is_better=lower_is_better,
+                        )
+                    )
+
+        unconstrainable_metrics = objective.get_unconstrainable_metrics()
+        OptimizationConfig._validate_outcome_constraints(
+            unconstrainable_metrics=unconstrainable_metrics,
+            outcome_constraints=outcome_constraints,
+        )
+
+    def __repr__(self) -> str:
+        return MOOC_TEMPLATE.format(
+            objective=repr(self.objective),
+            constraints=", ".join(
+                constraint.__repr__() for constraint in self.outcome_constraints
+            ),
+            thresholds=", ".join(
+                threshold.__repr__() for threshold in self.objective_thresholds
+            ),
+        )
+
+
+def make_wrong_direction_warning(
+    metric_name: str, bounded_above: bool, lower_is_better: Optional[bool]
+) -> str:
+    return (
+        f"Constraint on {metric_name} bounds from "
+        f"{'above' if bounded_above else 'below'} "
+        f"but {metric_name} is being "
+        f"{'minimized' if lower_is_better else 'maximized'}."
+    ).format(metric_name)

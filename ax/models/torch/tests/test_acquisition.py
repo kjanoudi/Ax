@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import torch
 from ax.models.torch.botorch_modular.acquisition import Acquisition
+from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
 from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.utils.common.constants import Keys
 from ax.utils.common.testutils import TestCase
@@ -17,9 +18,9 @@ from botorch.models.gp_regression import SingleTaskGP
 from botorch.utils.containers import TrainingData
 
 
-ACQUISITION_PATH = f"{Acquisition.__module__}"
-CURRENT_PATH = f"{__name__}"
-SURROGATE_PATH = f"{Surrogate.__module__}"
+ACQUISITION_PATH = Acquisition.__module__
+CURRENT_PATH = __name__
+SURROGATE_PATH = Surrogate.__module__
 
 
 # Used to avoid going through BoTorch `Acquisition.__init__` which
@@ -86,12 +87,10 @@ class AcquisitionTest(TestCase):
         f"{CURRENT_PATH}.Acquisition.compute_model_dependencies",
         return_value={"current_value": 1.2},
     )
-    @patch(f"{CURRENT_PATH}.Acquisition.compute_data_dependencies", return_value={})
     @patch(f"{DummyACQFClass.__module__}.DummyACQFClass.__init__", return_value=None)
     def test_init(
         self,
         mock_botorch_acqf_class,
-        mock_compute_data_deps,
         mock_compute_model_deps,
         mock_get_objective,
         mock_subset_model,
@@ -161,23 +160,8 @@ class AcquisitionTest(TestCase):
             X_observed=torch.tensor([3.0]),
             use_scalarized_objective=False,
         )
-        # Check `compute_model_dependencies` kwargs
-        mock_compute_model_deps.assert_called_with(
-            surrogate=self.surrogate,
-            bounds=self.bounds,
-            objective_weights=self.objective_weights,
-            pending_observations=self.pending_observations,
-            outcome_constraints=self.outcome_constraints,
-            linear_constraints=self.linear_constraints,
-            fixed_features=self.fixed_features,
-            target_fidelities=self.target_fidelities,
-            options=self.options,
-        )
-        # Check `compute_data_dependencies` kwargs
-        mock_compute_data_deps.assert_called_with(training_data=self.training_data)
         # Check final `acqf` creation
         model_deps = {Keys.CURRENT_VALUE: 1.2}
-        data_deps = {}
         mock_botorch_acqf_class.assert_called_with(
             model=self.acquisition.surrogate.model,
             objective=botorch_objective,
@@ -185,7 +169,6 @@ class AcquisitionTest(TestCase):
             X_baseline=torch.tensor([3.0]),
             **self.options,
             **model_deps,
-            **data_deps,
         )
 
     @patch(f"{ACQUISITION_PATH}.optimize_acqf")
@@ -233,3 +216,16 @@ class AcquisitionTest(TestCase):
     def test_evaluate(self, mock_call):
         self.acquisition.evaluate(X=self.X)
         mock_call.assert_called_with(X=self.X)
+
+    def test_extract_training_data(self):
+        self.assertEqual(  # Base `Surrogate` case.
+            self.acquisition._extract_training_data(surrogate=self.surrogate),
+            self.training_data,
+        )
+        # `ListSurrogate` case.
+        list_surrogate = ListSurrogate(botorch_submodel_class=self.botorch_model_class)
+        list_surrogate._training_data_per_outcome = {"a": self.training_data}
+        self.assertEqual(
+            self.acquisition._extract_training_data(surrogate=list_surrogate),
+            list_surrogate._training_data_per_outcome,
+        )

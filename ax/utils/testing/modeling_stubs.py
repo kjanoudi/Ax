@@ -140,14 +140,17 @@ def get_observation2trans() -> Observation:
 # Modeling layer
 
 
-def get_generation_strategy(with_experiment: bool = False) -> GenerationStrategy:
+def get_generation_strategy(
+    with_experiment: bool = False, with_callable_model_kwarg: bool = True
+) -> GenerationStrategy:
     gs = choose_generation_strategy(search_space=get_search_space())
     if with_experiment:
         gs._experiment = get_experiment()
     fake_func = get_experiment
-    # pyre-ignore[16]: testing hack to test serialization of callable kwargs
-    # in generation steps.
-    gs._steps[0].model_kwargs["model_constructor"] = fake_func
+    if with_callable_model_kwarg:
+        # pyre-ignore[16]: testing hack to test serialization of callable kwargs
+        # in generation steps.
+        gs._steps[0].model_kwargs["model_constructor"] = fake_func
     return gs
 
 
@@ -172,6 +175,8 @@ class transform_1(Transform):
         fixed_features: ObservationFeatures,
     ) -> OptimizationConfig:
         return (  # pyre-ignore[7]: pyre is right, this is a hack for testing.
+            # pyre-fixme[58]: `+` is not supported for operand types
+            #  `OptimizationConfig` and `int`.
             optimization_config + 1
             if isinstance(optimization_config, int)
             else optimization_config
@@ -183,7 +188,10 @@ class transform_1(Transform):
         for obsf in observation_features:
             if "x" in obsf.parameters:
                 obsf.parameters["x"] = (
-                    not_none(obsf.parameters["x"]) + 1  # pyre-ignore[6]
+                    # pyre-fixme[58]: `+` is not supported for operand types
+                    #  `Union[float, str]` and `int`.
+                    not_none(obsf.parameters["x"])
+                    + 1
                 )
         return observation_features
 
@@ -226,6 +234,8 @@ class transform_2(Transform):
         fixed_features: ObservationFeatures,
     ) -> OptimizationConfig:
         return (
+            # pyre-fixme[58]: `**` is not supported for operand types
+            #  `OptimizationConfig` and `int`.
             optimization_config ** 2
             if isinstance(optimization_config, int)
             else optimization_config

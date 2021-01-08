@@ -34,13 +34,10 @@ class REMBOInitializer(UniformGenerator):
         super().__init__(**kwargs)
 
     def project_up(self, X: np.ndarray) -> np.ndarray:
-        """Project to high-dimensional space.
-        """
+        """Project to high-dimensional space."""
         Z = np.transpose(self.A @ np.transpose(X))
         return np.clip(Z, a_min=-1, a_max=1)
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `bounds` expected.
     @copy_doc(UniformGenerator.gen)
     def gen(
         self,

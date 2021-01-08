@@ -4,11 +4,13 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import warnings
 from typing import Any, Iterable, List, Optional, Tuple
 
 from ax.core.metric import Metric
-from ax.utils.common.equality import Base
+from ax.utils.common.base import Base
 from ax.utils.common.logger import get_logger
 from ax.utils.common.typeutils import not_none
 
@@ -70,7 +72,7 @@ class Objective(Base):
         """Get a list of objective metrics."""
         return [self._metric]
 
-    def clone(self) -> "Objective":
+    def clone(self) -> Objective:
         """Create a copy of the objective."""
         return Objective(self.metric.clone(), self.minimize)
 
@@ -84,7 +86,6 @@ class Objective(Base):
         return self.metrics
 
 
-# TODO (jej): Support sqa_store encoding. Currenlty only single metric obj supported.
 class MultiObjective(Objective):
     """Class for an objective composed of a multiple component objectives.
 
@@ -138,7 +139,7 @@ class MultiObjective(Objective):
         """Get the objective metrics."""
         return self._metrics
 
-    def clone(self) -> "Objective":
+    def clone(self) -> Objective:
         """Create a copy of the objective."""
         return MultiObjective(
             metrics=[m.clone() for m in self.metrics], minimize=self.minimize
@@ -186,7 +187,7 @@ class ScalarizedObjective(MultiObjective):
         super().__init__(metrics, minimize)
         self.weights = weights
 
-    def clone(self) -> "Objective":
+    def clone(self) -> Objective:
         """Create a copy of the objective."""
         return ScalarizedObjective(
             metrics=[m.clone() for m in self.metrics],

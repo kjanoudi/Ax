@@ -51,17 +51,20 @@ class MaxValueEntropySearch(BotorchModel):
     """
 
     def __init__(
-        self, cost_intercept: float = 1.0, linear_truncated: bool = True, **kwargs: Any
+        self,
+        cost_intercept: float = 1.0,
+        linear_truncated: bool = True,
+        use_input_warping: bool = False,
+        **kwargs: Any,
     ) -> None:
         super().__init__(
             best_point_recommender=recommend_best_out_of_sample_point,
             linear_truncated=linear_truncated,
+            use_input_warping=use_input_warping,
             **kwargs,
         )
         self.cost_intercept = cost_intercept
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `bounds` expected.
     @copy_doc(TorchModel.gen)
     def gen(
         self,

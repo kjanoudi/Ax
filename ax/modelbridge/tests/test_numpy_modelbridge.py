@@ -11,7 +11,10 @@ import numpy as np
 from ax.core.metric import Metric
 from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
 from ax.core.observation import Observation, ObservationData, ObservationFeatures
-from ax.core.optimization_config import OptimizationConfig
+from ax.core.optimization_config import (
+    MultiObjectiveOptimizationConfig,
+    OptimizationConfig,
+)
 from ax.core.outcome_constraint import ComparisonOp, OutcomeConstraint
 from ax.core.parameter import ChoiceParameter, ParameterType, RangeParameter
 from ax.core.parameter_constraint import OrderConstraint, SumConstraint
@@ -114,6 +117,7 @@ class NumpyModelBridgeTest(TestCase):
 
         # And update
         ma._update(
+            search_space=self.search_space,
             observation_features=self.observation_features,
             observation_data=self.observation_data,
         )
@@ -244,7 +248,7 @@ class NumpyModelBridgeTest(TestCase):
         )
 
         # Test with MultiObjective (unweighted multiple objectives)
-        oc3 = OptimizationConfig(
+        oc3 = MultiObjectiveOptimizationConfig(
             objective=MultiObjective(
                 metrics=[Metric(name="a"), Metric(name="b", lower_is_better=True)],
                 minimize=True,
@@ -320,7 +324,10 @@ class NumpyModelBridgeTest(TestCase):
         ma.parameters = ["x", "y", "z"]
         ma.outcomes = ["a", "b"]
         observation_data = ma._cross_validate(
-            self.observation_features, self.observation_data, self.observation_features
+            search_space=self.search_space,
+            obs_feats=self.observation_features,
+            obs_data=self.observation_data,
+            cv_test_points=self.observation_features,
         )
         Xs = [
             np.array([[0.2, 1.2, 3.0], [0.4, 1.4, 3.0], [0.6, 1.6, 3]]),

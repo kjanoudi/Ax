@@ -11,6 +11,7 @@ from ax.models.torch.botorch_modular.acquisition import Acquisition
 from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.utils.common.constants import Keys
 from ax.utils.common.testutils import TestCase
+from ax.utils.testing.torch_stubs import get_torch_test_data
 from botorch.acquisition.monte_carlo import qSimpleRegret
 from botorch.models.gp_regression import SingleTaskGP
 from botorch.models.model import Model
@@ -32,23 +33,20 @@ class SurrogateTest(TestCase):
         self.mll_class = ExactMarginalLogLikelihood
         self.device = torch.device("cpu")
         self.dtype = torch.float
-        self.X = torch.tensor(
-            [[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]], dtype=self.dtype, device=self.device
+        self.Xs, self.Ys, self.Yvars, self.bounds, _, _, _ = get_torch_test_data(
+            dtype=self.dtype
         )
-
-        self.Y = torch.tensor([[3.0], [4.0]], dtype=self.dtype, device=self.device)
-        self.Yvar = torch.tensor([[0.0], [2.0]], dtype=self.dtype, device=self.device)
-
-        self.training_data = TrainingData(X=self.X, Y=self.Y, Yvar=self.Yvar)
+        self.training_data = TrainingData(
+            X=self.Xs[0], Y=self.Ys[0], Yvar=self.Yvars[0]
+        )
         self.surrogate_kwargs = self.botorch_model_class.construct_inputs(
             self.training_data
         )
         self.surrogate = Surrogate(
             botorch_model_class=self.botorch_model_class, mll_class=self.mll_class
         )
-        self.bounds = [(0.0, 1.0), (1.0, 4.0), (2.0, 5.0)]
         self.task_features = []
-        self.feature_names = ["x1", "x2", "x3"]
+        self.feature_names = ["x1", "x2"]
         self.metric_names = ["y"]
         self.fidelity_features = []
         self.target_fidelities = {1: 1.0}
@@ -108,20 +106,21 @@ class SurrogateTest(TestCase):
             self.botorch_model_class(**self.surrogate_kwargs)
         )
         self.assertIsInstance(surrogate.model, self.botorch_model_class)
-        self.assertFalse(surrogate._should_reconstruct)
+        self.assertTrue(surrogate._constructed_manually)
 
     @patch(f"{CURRENT_PATH}.SingleTaskGP.__init__", return_value=None)
     def test_construct(self, mock_GP):
-        base_surrogate = Surrogate(botorch_model_class=Model)
-        with self.assertRaisesRegex(TypeError, "Cannot construct an abstract model."):
-            base_surrogate.construct(
+        with self.assertRaises(NotImplementedError):
+            # Base `Model` does not implement `construct_inputs`.
+            Surrogate(botorch_model_class=Model).construct(
                 training_data=self.training_data,
                 fidelity_features=self.fidelity_features,
             )
         self.surrogate.construct(
             training_data=self.training_data, fidelity_features=self.fidelity_features
         )
-        mock_GP.assert_called_with(train_X=self.X, train_Y=self.Y)
+        mock_GP.assert_called_with(train_X=self.Xs[0], train_Y=self.Ys[0])
+        self.assertFalse(self.surrogate._constructed_manually)
 
     @patch(f"{CURRENT_PATH}.SingleTaskGP.load_state_dict", return_value=None)
     @patch(f"{CURRENT_PATH}.ExactMarginalLogLikelihood")
@@ -153,7 +152,7 @@ class SurrogateTest(TestCase):
         mock_fit_gpytorch.reset_mock()
         # Should `load_state_dict` when `state_dict` is not `None`
         # and `refit` is `False`.
-        state_dict = {}
+        state_dict = {"state_attribute": "value"}
         surrogate.fit(
             training_data=self.training_data,
             bounds=self.bounds,
@@ -174,8 +173,8 @@ class SurrogateTest(TestCase):
         self.surrogate.construct(
             training_data=self.training_data, fidelity_features=self.fidelity_features
         )
-        self.surrogate.predict(X=self.X)
-        mock_predict.assert_called_with(model=self.surrogate.model, X=self.X)
+        self.surrogate.predict(X=self.Xs[0])
+        mock_predict.assert_called_with(model=self.surrogate.model, X=self.Xs[0])
 
     def test_best_in_sample_point(self):
         self.surrogate.construct(
@@ -190,7 +189,7 @@ class SurrogateTest(TestCase):
                     bounds=self.bounds, objective_weights=None
                 )
         with patch(
-            f"{SURROGATE_PATH}.best_in_sample_point", return_value=(self.X, 0.0)
+            f"{SURROGATE_PATH}.best_in_sample_point", return_value=(self.Xs[0], 0.0)
         ) as mock_best_in_sample:
             best_point, observed_value = self.surrogate.best_in_sample_point(
                 bounds=self.bounds,
@@ -269,7 +268,9 @@ class SurrogateTest(TestCase):
             feature_names=self.feature_names,
             metric_names=self.metric_names,
             fidelity_features=self.fidelity_features,
+            target_fidelities=self.target_fidelities,
             refit=self.refit,
+            state_dict={"key": "val"},
         )
         mock_fit.assert_called_with(
             training_data=self.training_data,
@@ -278,15 +279,14 @@ class SurrogateTest(TestCase):
             feature_names=self.feature_names,
             metric_names=self.metric_names,
             fidelity_features=self.fidelity_features,
+            target_fidelities=self.target_fidelities,
             candidate_metadata=None,
-            state_dict=self.surrogate.model.state_dict,
             refit=self.refit,
+            state_dict={"key": "val"},
         )
         # If should not be reconstructed, raise Error
-        self.surrogate._should_reconstruct = False
-        with self.assertRaisesRegex(
-            NotImplementedError, ".* models that should not be re-constructed"
-        ):
+        self.surrogate._constructed_manually = True
+        with self.assertRaisesRegex(NotImplementedError, ".* constructed manually"):
             self.surrogate.update(
                 training_data=self.training_data,
                 bounds=self.bounds,
@@ -296,3 +296,7 @@ class SurrogateTest(TestCase):
                 fidelity_features=self.fidelity_features,
                 refit=self.refit,
             )
+
+    def test_serialize_attributes_as_kwargs(self):
+        expected = self.surrogate.__dict__
+        self.assertEqual(self.surrogate._serialize_attributes_as_kwargs(), expected)

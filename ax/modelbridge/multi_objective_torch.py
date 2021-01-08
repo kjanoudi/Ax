@@ -4,26 +4,36 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import numpy as np
 import torch
 from ax.core.data import Data
 from ax.core.experiment import Experiment
 from ax.core.generator_run import GeneratorRun
-from ax.core.multi_type_experiment import MultiTypeExperiment
 from ax.core.observation import ObservationData, ObservationFeatures
-from ax.core.optimization_config import OptimizationConfig
+from ax.core.optimization_config import (
+    MultiObjectiveOptimizationConfig,
+    OptimizationConfig,
+    TRefPoint,
+)
 from ax.core.search_space import SearchSpace
 from ax.core.types import TCandidateMetadata, TConfig, TGenMetadata
 from ax.modelbridge.array import FIT_MODEL_ERROR
+from ax.modelbridge.modelbridge_utils import (
+    extract_objective_thresholds,
+    validate_and_apply_final_transform,
+)
 from ax.modelbridge.torch import TorchModelBridge
 from ax.modelbridge.transforms.base import Transform
+from ax.models.torch.frontier_utils import (
+    TFrontierEvaluator,
+    get_default_frontier_evaluator,
+)
 from ax.models.torch_base import TorchModel
 from ax.utils.common.docutils import copy_doc
 from ax.utils.common.logger import get_logger
-from ax.utils.common.typeutils import not_none
-from torch import Tensor
+from ax.utils.common.typeutils import checked_cast_optional, not_none
 
 
 logger = get_logger("MultiObjectiveTorchModelBridge")
@@ -43,7 +53,6 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
     them to the model.
     """
 
-    _transformed_ref_point: Optional[Dict[str, float]]
     _objective_metric_names: Optional[List[str]]
 
     def __init__(
@@ -58,24 +67,32 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
         torch_device: Optional[torch.device] = None,
         status_quo_name: Optional[str] = None,
         status_quo_features: Optional[ObservationFeatures] = None,
-        optimization_config: Optional[OptimizationConfig] = None,
+        optimization_config: Optional[MultiObjectiveOptimizationConfig] = None,
         fit_out_of_design: bool = False,
-        ref_point: Optional[Dict[str, float]] = None,
+        objective_thresholds: Optional[TRefPoint] = None,
         default_model_gen_options: Optional[TConfig] = None,
     ) -> None:
-        if isinstance(experiment, MultiTypeExperiment) and ref_point is not None:
-            raise NotImplementedError(
-                "Ref-point dependent multi-objective optimization algorithms "
-                "like EHVI are not yet supported for MultiTypeExperiments. "
-                "Remove the reference point arg and use a compatible algorithm "
-                "like ParEGO."
-            )
-        self.ref_point = ref_point
-        self._transformed_ref_point = None
         self._objective_metric_names = None
-        oc = optimization_config or experiment.optimization_config
-        if oc:
-            self._objective_metric_names = [m.name for m in oc.objective.metrics]
+        # Optimization_config
+        mooc = optimization_config or checked_cast_optional(
+            MultiObjectiveOptimizationConfig, experiment.optimization_config
+        )
+        # Extract objective_thresholds from optimization_config, or inject it.
+        if not mooc:
+            raise ValueError(
+                (
+                    "experiment must have an existing optimization_config "
+                    "of type MultiObjectiveOptimizationConfig "
+                    "or `optimization_config` must be passed as an argument."
+                )
+            )
+        if not isinstance(mooc, MultiObjectiveOptimizationConfig):
+            mooc = not_none(MultiObjectiveOptimizationConfig.from_opt_conf(mooc))
+        if objective_thresholds:
+            mooc = mooc.clone_with_args(objective_thresholds=objective_thresholds)
+
+        optimization_config = mooc
+
         super().__init__(
             experiment=experiment,
             search_space=search_space,
@@ -92,6 +109,25 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
             default_model_gen_options=default_model_gen_options,
         )
 
+    def _get_extra_model_gen_kwargs(
+        self, optimization_config: OptimizationConfig
+    ) -> Dict[str, Any]:
+        extra_kwargs_dict = {}
+        if isinstance(optimization_config, MultiObjectiveOptimizationConfig):
+            objective_thresholds = extract_objective_thresholds(
+                objective_thresholds=optimization_config.objective_thresholds,
+                outcomes=self.outcomes,
+            )
+        else:
+            objective_thresholds = np.array([])
+        # pyre-fixme[35]: Target cannot be annotated.
+        objective_thresholds: Optional[np.ndarray] = (
+            objective_thresholds if len(objective_thresholds) else None
+        )
+        if objective_thresholds is not None:
+            extra_kwargs_dict["objective_thresholds"] = objective_thresholds
+        return extra_kwargs_dict
+
     def _model_gen(
         self,
         n: int,
@@ -104,28 +140,22 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
         model_gen_options: Optional[TConfig],
         rounding_func: Callable[[np.ndarray], np.ndarray],
         target_fidelities: Optional[Dict[int, float]],
+        objective_thresholds: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, TGenMetadata, List[TCandidateMetadata]]:
         if not self.model:  # pragma: no cover
             raise ValueError(FIT_MODEL_ERROR.format(action="_model_gen"))
-        obj_w, oc_c, l_c, pend_obs = self._validate_and_convert_to_tensors(
+        obj_w, oc_c, l_c, pend_obs = validate_and_apply_final_transform(
             objective_weights=objective_weights,
             outcome_constraints=outcome_constraints,
             linear_constraints=linear_constraints,
             pending_observations=pending_observations,
+            final_transform=self._array_to_tensor,
         )
-        ref_point = None
-        if self._transformed_ref_point:
-            ref_point = not_none(self._transformed_ref_point)
-        else:
-            logger.warning(
-                "No attribute _transformed_ref_point. Using untransformed ref_point."
-            )
-        if ref_point is not None:
-            ref_point_list = [
-                ref_point[name] for name in not_none(self.outcomes) if name in ref_point
-            ]
-        else:
-            ref_point_list = None
+        obj_t = (
+            self._array_to_tensor(objective_thresholds)
+            if objective_thresholds is not None
+            else None
+        )
         tensor_rounding_func = self._array_callable_to_tensor_callable(rounding_func)
         augmented_model_gen_options = {
             **self._default_model_gen_options,
@@ -137,13 +167,13 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
             bounds=bounds,
             objective_weights=obj_w,
             outcome_constraints=oc_c,
+            objective_thresholds=obj_t,
             linear_constraints=l_c,
             fixed_features=fixed_features,
             pending_observations=pend_obs,
             model_gen_options=augmented_model_gen_options,
             rounding_func=tensor_rounding_func,
             target_fidelities=target_fidelities,
-            ref_point=ref_point_list,
         )
         return (
             X.detach().cpu().clone().numpy(),
@@ -169,50 +199,8 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
             transforms=transforms,
             transform_configs=transform_configs,
         )
-
-        ref_point = self.ref_point
-        metric_names = list(self._metric_names or [])
-        objective_metric_names = list(self._objective_metric_names or [])
-        if ref_point and metric_names and objective_metric_names:
-            num_metrics = len(metric_names)
-            if obs_data:
-                # Create synthetic ObservationData representing the reference point.
-                # Pad with non-objective outcomes from existing data.
-                # Should always have existing data with BO.
-                sample_obs_data = obs_data[0]
-                padded_ref_dict: Dict[str, float] = dict(
-                    zip(sample_obs_data.metric_names, sample_obs_data.means)
-                )
-                padded_ref_dict.update(ref_point)
-                ref_obs_data = [
-                    ObservationData(
-                        metric_names=list(padded_ref_dict.keys()),
-                        means=np.array(list(padded_ref_dict.values())),
-                        covariance=np.zeros((num_metrics, num_metrics)),
-                    )
-                ]
-                ref_obs_feats = []
-
-                # Apply initialized transforms to reference point.
-                for t in self.transforms.values():
-                    ref_obs_data = t.transform_observation_data(
-                        ref_obs_data, ref_obs_feats
-                    )
-                transformed_ref_obsd = ref_obs_data.pop()
-                transformed_ref_dict = dict(
-                    zip(transformed_ref_obsd.metric_names, transformed_ref_obsd.means)
-                )
-                self._transformed_ref_point = {
-                    objective_metric_name: transformed_ref_dict[objective_metric_name]
-                    for objective_metric_name in objective_metric_names
-                }
-            else:
-                # No previous data means transform can't have been fit.
-                pass
         return obs_feats, obs_data, search_space
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Call expects argument `n`.
     @copy_doc(TorchModelBridge.gen)
     def gen(
         self,
@@ -237,15 +225,10 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
             model_gen_options=model_gen_options,
         )
 
-    # TODO: Complete these stubs based on https://fb.quip.com/fUMRATIeahCy
-    def pareto_frontier(self, X: Tensor) -> Tensor:
-        raise NotImplementedError()
-
-    def observed_pareto_frontier(self) -> Tensor:
-        raise NotImplementedError()
-
-    def hypervolume(self, X: Tensor) -> Tensor:
-        raise NotImplementedError()
-
-    def observed_hypervolume(self) -> Tensor:
-        raise NotImplementedError()
+    def _get_frontier_evaluator(self) -> TFrontierEvaluator:
+        return (
+            # pyre-ignore [16]: `TorchModel has no attribute `frontier_evaluator`
+            not_none(self.model).frontier_evaluator
+            if hasattr(self.model, "frontier_evaluator")
+            else get_default_frontier_evaluator()
+        )

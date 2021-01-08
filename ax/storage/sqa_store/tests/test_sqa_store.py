@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from datetime import datetime
-from unittest.mock import MagicMock, Mock
+from inspect import signature
+from typing import Callable
+from unittest.mock import MagicMock, Mock, patch
 
 from ax.core.arm import Arm
 from ax.core.base_trial import TrialStatus
@@ -34,7 +36,7 @@ from ax.storage.sqa_store.db import (
     session_scope,
 )
 from ax.storage.sqa_store.decoder import Decoder
-from ax.storage.sqa_store.encoder import Encoder
+from ax.storage.sqa_store.encoder import T_OBJ_TO_SQA, Encoder
 from ax.storage.sqa_store.load import (
     load_experiment,
     load_generation_strategy_by_experiment_name,
@@ -82,8 +84,10 @@ from ax.utils.testing.core_stubs import (
     get_experiment_with_scalarized_objective,
     get_fixed_parameter,
     get_generator_run,
+    get_multi_objective_optimization_config,
     get_multi_type_experiment,
     get_objective,
+    get_objective_threshold,
     get_optimization_config,
     get_outcome_constraint,
     get_range_parameter,
@@ -93,6 +97,19 @@ from ax.utils.testing.core_stubs import (
     get_synthetic_runner,
 )
 from ax.utils.testing.modeling_stubs import get_generation_strategy
+
+
+def _encode_func_returns_obj_to_sqa(encode_func: Callable) -> bool:
+    """Some encoding functions return both the encoded object and `obj_to_sqa`,
+    with the latter being a list of tuples of form (obj, sqa_obj), used to
+    set `db_id` on Ax objects after they are saved. This function checks
+    return type of `encode_func` to determine whether `encode_func` is one
+    of such functions.
+    """
+    encode_func_return_type = signature(encode_func).return_annotation
+    return (getattr(encode_func_return_type, "_name", "") == "Tuple") and (
+        T_OBJ_TO_SQA in getattr(encode_func_return_type, "__args__", ())
+    )
 
 
 class SQAStoreTest(TestCase):
@@ -144,7 +161,7 @@ class SQAStoreTest(TestCase):
             self.assertEqual(engine.pool.size(), 2)
 
     def testEquals(self):
-        trial_sqa = self.encoder.trial_to_sqa(get_batch_trial())
+        trial_sqa = self.encoder.trial_to_sqa(get_batch_trial())[0]
         self.assertTrue(trial_sqa.equals(trial_sqa))
 
     def testListEquals(self):
@@ -180,7 +197,7 @@ class SQAStoreTest(TestCase):
             self.encoder.generator_run_to_sqa(generator_run)
 
         generator_run._generator_run_type = "STATUS_QUO"
-        generator_run_sqa = self.encoder.generator_run_to_sqa(generator_run)
+        generator_run_sqa = self.encoder.generator_run_to_sqa(generator_run)[0]
         generator_run_sqa.generator_run_type = 2
         with self.assertRaises(SQADecodeError):
             self.decoder.generator_run_from_sqa(generator_run_sqa)
@@ -194,10 +211,93 @@ class SQAStoreTest(TestCase):
             get_experiment_with_multi_objective(),
             get_experiment_with_scalarized_objective(),
         ]:
-            exp = self.experiment
+            self.assertIsNone(exp.db_id)
             save_experiment(exp)
+            self.assertIsNotNone(exp.db_id)
             loaded_experiment = load_experiment(exp.name)
             self.assertEqual(loaded_experiment, exp)
+
+    @patch(
+        f"{Decoder.__module__}.Decoder.generator_run_from_sqa",
+        side_effect=Decoder(SQAConfig()).generator_run_from_sqa,
+    )
+    @patch(
+        f"{Decoder.__module__}.Decoder.trial_from_sqa",
+        side_effect=Decoder(SQAConfig()).trial_from_sqa,
+    )
+    @patch(
+        f"{Decoder.__module__}.Decoder.experiment_from_sqa",
+        side_effect=Decoder(SQAConfig()).experiment_from_sqa,
+    )
+    def testExperimentSaveAndLoadReducedState(
+        self, _mock_exp_from_sqa, _mock_trial_from_sqa, _mock_gr_from_sqa
+    ):
+        # 1. No abandoned arms + no trials case, reduced state should be the
+        # same as non-reduced state.
+        exp = get_experiment_with_multi_objective()
+        save_experiment(exp)
+        loaded_experiment = load_experiment(exp.name, reduced_state=True)
+        self.assertEqual(loaded_experiment, exp)
+        _mock_exp_from_sqa.assert_called_once()
+        _mock_trial_from_sqa.assert_not_called()  # No trials on exp.
+        # Make sure decoder function was called with `reduced_state=True`.
+        self.assertTrue(_mock_exp_from_sqa.call_args().get("reduced_state"), True)
+        _mock_exp_from_sqa.reset_mock()
+
+        # 2. Try case with abandoned arms.
+        exp = self.experiment
+        save_experiment(exp)
+        loaded_experiment = load_experiment(exp.name, reduced_state=True)
+        # Experiments are not the same, because one has abandoned arms info.
+        self.assertNotEqual(loaded_experiment, exp)
+        # Remove all abandoned arms and check that all else is equal as expected.
+        exp.trials.get(0)._abandoned_arms_metadata = {}
+        self.assertEqual(loaded_experiment, exp)
+        # Make sure that all relevant decoding functions were called with
+        # `reduced_state=True` and correct number of times.
+        _mock_exp_from_sqa.assert_called_once()
+        self.assertTrue(_mock_exp_from_sqa.call_args().get("reduced_state"), True)
+        _mock_trial_from_sqa.assert_called_once()
+        self.assertTrue(_mock_trial_from_sqa.call_args().get("reduced_state"), True)
+        # 2 generator runs + regular and status quo.
+        self.assertEqual(len(_mock_gr_from_sqa.call_args_list), 2)
+        self.assertTrue(_mock_gr_from_sqa.call_args().get("reduced_state"), True)
+        _mock_exp_from_sqa.reset_mock()
+        _mock_trial_from_sqa.reset_mock()
+        _mock_gr_from_sqa.reset_mock()
+
+        # 3. Try case with model state and search space + opt.config on a
+        # generator run in the experiment.
+        gr = Models.SOBOL(experiment=exp).gen(1)
+        # Expecting model kwargs to have 5 fields (deduplicate, init_position, etc.)
+        # and the rest of model-state info on generator run to have values too.
+        self.assertEqual(len(gr._model_kwargs), 5)
+        self.assertEqual(len(gr._bridge_kwargs), 6)
+        self.assertEqual(len(gr._model_state_after_gen), 1)
+        self.assertEqual(len(gr._gen_metadata), 0)
+        self.assertIsNotNone(gr._search_space, gr.optimization_config)
+        exp.new_trial(generator_run=gr)
+        save_experiment(exp)
+        # Make sure that all relevant decoding functions were called with
+        # `reduced_state=True` and correct number of times.
+        loaded_experiment = load_experiment(exp.name, reduced_state=True)
+        _mock_exp_from_sqa.assert_called_once()
+        self.assertTrue(_mock_exp_from_sqa.call_args().get("reduced_state"), True)
+        self.assertEqual(len(_mock_trial_from_sqa.call_args_list), 2)
+        self.assertTrue(_mock_trial_from_sqa.call_args().get("reduced_state"), True)
+        # 2 generator runs from trial #0 + 1 from trial #1.
+        self.assertEqual(len(_mock_gr_from_sqa.call_args_list), 3)
+        self.assertTrue(_mock_gr_from_sqa.call_args().get("reduced_state"), True)
+        self.assertNotEqual(loaded_experiment, exp)
+        # Remove all fields that are not part of the reduced state and
+        # check that everything else is equal as expected.
+        exp.trials.get(1).generator_run._model_kwargs = None
+        exp.trials.get(1).generator_run._bridge_kwargs = None
+        exp.trials.get(1).generator_run._gen_metadata = None
+        exp.trials.get(1).generator_run._model_state_after_gen = None
+        exp.trials.get(1).generator_run._search_space = None
+        exp.trials.get(1).generator_run._optimization_config = None
+        self.assertEqual(loaded_experiment, exp)
 
     def testMTExperimentSaveAndLoad(self):
         experiment = get_multi_type_experiment(add_trials=True)
@@ -302,6 +402,10 @@ class SQAStoreTest(TestCase):
             encode_func = unbound_encode_func.__get__(self.encoder)
             decode_func = unbound_decode_func.__get__(self.decoder)
             sqa_object = encode_func(original_object)
+            if _encode_func_returns_obj_to_sqa(encode_func=encode_func):
+                # Some encoding functions returns two things, of which for
+                # encoding we only care about the first.
+                sqa_object = sqa_object[0]
 
             if class_ in ["OrderConstraint", "ParameterConstraint", "SumConstraint"]:
                 converted_object = decode_func(sqa_object, self.dummy_parameters)
@@ -341,6 +445,10 @@ class SQAStoreTest(TestCase):
 
             encode_func = unbound_encode_func.__get__(self.encoder)
             sqa_object = encode_func(original_object)
+            if _encode_func_returns_obj_to_sqa(encode_func=encode_func):
+                # Some encoding functions returns two things, of which for
+                # encoding we only care about the first.
+                sqa_object = sqa_object[0]
 
             if isinstance(
                 original_object, AbandonedArm
@@ -556,6 +664,53 @@ class SQAStoreTest(TestCase):
         self.assertEqual(
             get_session().query(SQAMetric).count(), len(experiment.metrics)
         )
+
+        loaded_experiment = load_experiment(experiment.name)
+        self.assertEqual(experiment, loaded_experiment)
+
+    def testExperimentObjectiveThresholdUpdates(self):
+        experiment = get_experiment_with_batch_trial()
+        save_experiment(experiment)
+        self.assertEqual(
+            get_session().query(SQAMetric).count(), len(experiment.metrics)
+        )
+
+        # update objective threshold
+        # (should perform update in place)
+        optimization_config = get_multi_objective_optimization_config()
+        objective_threshold = get_objective_threshold()
+        optimization_config.objective_thresholds = [objective_threshold]
+        experiment.optimization_config = optimization_config
+        save_experiment(experiment)
+        self.assertEqual(get_session().query(SQAMetric).count(), 6)
+
+        # add outcome constraint
+        outcome_constraint2 = OutcomeConstraint(
+            metric=Metric(name="outcome"), op=ComparisonOp.GEQ, bound=-0.5
+        )
+        optimization_config.outcome_constraints = [
+            optimization_config.outcome_constraints[0],
+            outcome_constraint2,
+        ]
+        experiment.optimization_config = optimization_config
+        save_experiment(experiment)
+        self.assertEqual(get_session().query(SQAMetric).count(), 7)
+
+        # remove outcome constraint
+        # (old one should become tracking metric)
+        optimization_config.outcome_constraints = []
+        experiment.optimization_config = optimization_config
+        save_experiment(experiment)
+        self.assertEqual(get_session().query(SQAMetric).count(), 5)
+
+        loaded_experiment = load_experiment(experiment.name)
+        self.assertEqual(experiment, loaded_experiment)
+
+        # Optimization config should correctly reload even with no
+        # objective_thresholds
+        optimization_config.objective_thresholds = []
+        save_experiment(experiment)
+        self.assertEqual(get_session().query(SQAMetric).count(), 4)
 
         loaded_experiment = load_experiment(experiment.name)
         self.assertEqual(experiment, loaded_experiment)
@@ -939,11 +1094,13 @@ class SQAStoreTest(TestCase):
 
         # Check that we can encode and decode the generation strategy *after*
         # it has generated some trials and been updated with some data.
-        generation_strategy = new_generation_strategy
+        # Since we now need to `gen`, we remove the fake callable kwarg we added,
+        # since model does not expect it.
+        generation_strategy = get_generation_strategy(with_callable_model_kwarg=False)
         experiment.new_trial(generation_strategy.gen(experiment=experiment))
         generation_strategy.gen(experiment, data=get_branin_data())
-        save_generation_strategy(generation_strategy=generation_strategy)
         save_experiment(experiment)
+        save_generation_strategy(generation_strategy=generation_strategy)
         # Try restoring the generation strategy using the experiment its
         # attached to.
         new_generation_strategy = load_generation_strategy_by_experiment_name(
@@ -955,12 +1112,103 @@ class SQAStoreTest(TestCase):
         self.assertEqual(len(new_generation_strategy._generator_runs), 2)
         self.assertEqual(new_generation_strategy._experiment._name, experiment._name)
 
+    def testEncodeDecodeGenerationStrategyReducedState(self):
+        """Try restoring the generation strategy using the experiment its attached to,
+        passing the experiment object.
+        """
+        generation_strategy = get_generation_strategy(with_callable_model_kwarg=False)
+        experiment = get_branin_experiment()
+        experiment.new_trial(generation_strategy.gen(experiment=experiment))
+        generation_strategy.gen(experiment, data=get_branin_data())
+        self.assertEqual(len(generation_strategy._generator_runs), 2)
+        save_experiment(experiment)
+        save_generation_strategy(generation_strategy=generation_strategy)
+
+        new_generation_strategy = load_generation_strategy_by_experiment_name(
+            experiment_name=experiment.name,
+            reduced_state=True,
+            experiment=experiment,
+        )
+        self.assertEqual(len(new_generation_strategy._generator_runs), 2)
+        # Experiment should be the exact same object passed into `load_...`
+        self.assertTrue(new_generation_strategy.experiment is experiment)
+        # Generation strategies should not be equal, since its generator run #0
+        # should be missing model state (and #1 should have it).
+        self.assertNotEqual(new_generation_strategy, generation_strategy)
+        generation_strategy._generator_runs[0]._model_kwargs = None
+        generation_strategy._generator_runs[0]._bridge_kwargs = None
+        generation_strategy._generator_runs[0]._gen_metadata = None
+        generation_strategy._generator_runs[0]._model_state_after_gen = None
+        generation_strategy._generator_runs[0]._search_space = None
+        generation_strategy._generator_runs[0]._optimization_config = None
+        # Now the generation strategies should be equal.
+        self.assertEqual(new_generation_strategy, generation_strategy)
+        # Model should be successfully restored in generation strategy even with
+        # the reduced state.
+        self.assertIsInstance(new_generation_strategy._steps[0].model, Models)
+        self.assertIsInstance(new_generation_strategy.model, ModelBridge)
+        self.assertEqual(len(new_generation_strategy._generator_runs), 2)
+        self.assertEqual(new_generation_strategy._experiment._name, experiment._name)
+
+    def testEncodeDecodeGenerationStrategyReducedStateLoadExperiment(self):
+        """Try restoring the generation strategy using the experiment its
+        attached to, not passing the experiment object (it should then be loaded
+        as part of generation strategy loading).
+        """
+        generation_strategy = get_generation_strategy(with_callable_model_kwarg=False)
+        experiment = get_branin_experiment()
+        experiment.new_trial(generation_strategy.gen(experiment=experiment))
+        generation_strategy.gen(experiment, data=get_branin_data())
+        self.assertEqual(len(generation_strategy._generator_runs), 2)
+        save_experiment(experiment)
+        save_generation_strategy(generation_strategy=generation_strategy)
+
+        new_generation_strategy = load_generation_strategy_by_experiment_name(
+            experiment_name=experiment.name,
+            reduced_state=True,
+        )
+        # Experiment should not be exactly the same object, since it was reloaded
+        # from DB and decoded.
+        self.assertFalse(new_generation_strategy.experiment is experiment)
+        # Generation strategies should not be equal, since only the original one
+        # has model state on generator run #0, not the reloaded one.
+        self.assertNotEqual(generation_strategy, new_generation_strategy)
+        self.assertNotEqual(
+            generation_strategy._generator_runs[0],
+            new_generation_strategy._generator_runs[0],
+        )
+        # Experiment should not be equal, since it would be loaded with reduced
+        # state along with the generation strategy.
+        self.assertNotEqual(new_generation_strategy.experiment, experiment)
+        # Adjust experiment and GS to reduced state.
+        experiment.trials.get(0).generator_run._model_kwargs = None
+        experiment.trials.get(0).generator_run._bridge_kwargs = None
+        experiment.trials.get(0).generator_run._gen_metadata = None
+        experiment.trials.get(0).generator_run._model_state_after_gen = None
+        experiment.trials.get(0).generator_run._search_space = None
+        experiment.trials.get(0).generator_run._optimization_config = None
+        generation_strategy._generator_runs[0]._model_kwargs = None
+        generation_strategy._generator_runs[0]._bridge_kwargs = None
+        generation_strategy._generator_runs[0]._gen_metadata = None
+        generation_strategy._generator_runs[0]._model_state_after_gen = None
+        generation_strategy._generator_runs[0]._search_space = None
+        generation_strategy._generator_runs[0]._optimization_config = None
+        # Now experiment on generation strategy should be equal to the original
+        # experiment with reduced state.
+        self.assertEqual(new_generation_strategy.experiment, experiment)
+        self.assertEqual(new_generation_strategy, generation_strategy)
+        # Model should be successfully restored in generation strategy even with
+        # the reduced state.
+        self.assertIsInstance(new_generation_strategy._steps[0].model, Models)
+        self.assertIsInstance(new_generation_strategy.model, ModelBridge)
+        self.assertEqual(len(new_generation_strategy._generator_runs), 2)
+        self.assertEqual(new_generation_strategy._experiment._name, experiment._name)
+
     def testUpdateGenerationStrategy(self):
-        generation_strategy = get_generation_strategy()
+        generation_strategy = get_generation_strategy(with_callable_model_kwarg=False)
         save_generation_strategy(generation_strategy=generation_strategy)
 
         experiment = get_branin_experiment()
-        generation_strategy = get_generation_strategy()
         save_experiment(experiment)
 
         # add generator run, save, reload
@@ -1008,7 +1256,7 @@ class SQAStoreTest(TestCase):
     def testGeneratorRunGenMetadata(self):
         gen_metadata = {"hello": "world"}
         gr = GeneratorRun(arms=[], gen_metadata=gen_metadata)
-        generator_run_sqa = self.encoder.generator_run_to_sqa(gr)
+        generator_run_sqa = self.encoder.generator_run_to_sqa(gr)[0]
         decoded_gr = self.decoder.generator_run_from_sqa(generator_run_sqa)
         self.assertEqual(decoded_gr.gen_metadata, gen_metadata)
 

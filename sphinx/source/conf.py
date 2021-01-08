@@ -36,7 +36,6 @@ sys.path.insert(0, os.path.abspath("../.."))
 extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.autodoc",
-    "sphinx_autodoc_typehints",
     "sphinx.ext.intersphinx",
     "sphinx.ext.todo",
     "sphinx.ext.coverage",
@@ -251,4 +250,8 @@ set_type_checking_flag = True
 # Mock SQLAlchemy base; otherwise have issues with trying to register same
 # class (with same table) multiple times through autodocs
 # Also mock Pandas to avoid circular imports due to TYPE_CHECKING = True
-autodoc_mock_imports = ["sqlalchemy.ext.declarative", "pandas"]
+autodoc_mock_imports = [
+    "sqlalchemy.ext.declarative",
+    "pandas",
+    "__test_modules__",
+]

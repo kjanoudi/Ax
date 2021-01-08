@@ -24,7 +24,7 @@ from ax.core.parameter import (
     RangeParameter,
 )
 from ax.core.types import ComparisonOp
-from ax.exceptions.core import DataRequiredError
+from ax.exceptions.core import DataRequiredError, UnsupportedPlotError
 from ax.metrics.branin import branin
 from ax.modelbridge.generation_strategy import GenerationStep, GenerationStrategy
 from ax.modelbridge.registry import MODEL_KEY_TO_MODEL_SETUP, Models
@@ -163,10 +163,11 @@ class TestAxClient(TestCase):
         ax_client.get_optimization_trace(objective_optimum=branin.fmin)
         ax_client.get_contour_plot()
         ax_client.get_feature_importances()
-        self.assertIn("x", ax_client.get_trials_data_frame())
-        self.assertIn("y", ax_client.get_trials_data_frame())
-        self.assertIn("a", ax_client.get_trials_data_frame())
-        self.assertEqual(len(ax_client.get_trials_data_frame()), 6)
+        trials_df = ax_client.get_trials_data_frame()
+        self.assertIn("x", trials_df)
+        self.assertIn("y", trials_df)
+        self.assertIn("a", trials_df)
+        self.assertEqual(len(trials_df), 6)
 
     def test_default_generation_strategy_discrete(self) -> None:
         """Test that Sobol is used if no GenerationStrategy is provided and
@@ -696,7 +697,7 @@ class TestAxClient(TestCase):
             ax_client.get_contour_plot(
                 param_x="x", param_y="y", metric_name="nonexistent"
             )
-        with self.assertRaisesRegex(ValueError, "Could not obtain contour"):
+        with self.assertRaisesRegex(UnsupportedPlotError, "Could not obtain contour"):
             ax_client.get_contour_plot(
                 param_x="x", param_y="y", metric_name="objective"
             )
@@ -989,3 +990,24 @@ class TestAxClient(TestCase):
         self.assertEqual(list(ax_client.experiment.metrics.keys()), ["a"])
         ax_client.complete_trial(trial_index=trial_idx, raw_data={"a": 1.0, "b": 2.0})
         self.assertEqual(list(ax_client.experiment.metrics.keys()), ["b", "a"])
+
+    @patch(
+        "ax.core.experiment.Experiment.new_trial",
+        side_effect=RuntimeError("cholesky_cpu error - bad matrix"),
+    )
+    def test_annotate_exception(self, _):
+        ax_client = AxClient()
+        ax_client.create_experiment(
+            name="test_experiment",
+            parameters=[
+                {"name": "x", "type": "range", "bounds": [-5.0, 10.0]},
+                {"name": "y", "type": "range", "bounds": [0.0, 15.0]},
+            ],
+            minimize=True,
+            objective_name="a",
+        )
+        with self.assertRaisesRegex(
+            expected_exception=RuntimeError,
+            expected_regex="Cholesky errors typically occur",
+        ):
+            ax_client.get_next_trial()

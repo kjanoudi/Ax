@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from ax.core.types import TConfig, TGenMetadata, TParamValue, TParamValueList
-from ax.exceptions.constants import TS_MIN_WEIGHT_ERROR
+from ax.exceptions.constants import TS_MIN_WEIGHT_ERROR, TS_NO_FEASIBLE_ARMS_ERROR
 from ax.exceptions.model import ModelError
 from ax.models.discrete_base import DiscreteModel
 from ax.utils.common.docutils import copy_doc
@@ -48,8 +48,6 @@ class ThompsonSampler(DiscreteModel):
         self.Yvars = None
         self.X_to_Ys_and_Yvars = None
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `Xs` expected.
     @copy_doc(DiscreteModel.fit)
     def fit(
         self,
@@ -67,8 +65,6 @@ class ThompsonSampler(DiscreteModel):
             X=self.X, Ys=self.Ys, Yvars=self.Yvars
         )
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `n` expected.
     @copy_doc(DiscreteModel.gen)
     def gen(
         self,
@@ -95,7 +91,8 @@ class ThompsonSampler(DiscreteModel):
         weighted_arms = [
             (weights[i], np.random.random(), arms[i])
             for i in range(k)
-            # pyre-fixme[6]: Expected `float` for 1st param but got `Optional[float]`.
+            # pyre-fixme[58]: `>` is not supported for operand types `float` and
+            #  `Optional[float]`.
             if weights[i] > min_weight
         ]
 
@@ -116,8 +113,6 @@ class ThompsonSampler(DiscreteModel):
 
         return top_arms, [x / sum(top_weights) for x in top_weights], {}
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `X` expected.
     @copy_doc(DiscreteModel.predict)
     def predict(self, X: List[TParamValueList]) -> Tuple[np.ndarray, np.ndarray]:
         n = len(X)  # number of parameterizations at which to make predictions
@@ -147,10 +142,7 @@ class ThompsonSampler(DiscreteModel):
             outcome_constraints=outcome_constraints,
         )
         if fraction_all_infeasible > 0.99:
-            raise ValueError(
-                "Less than 1% of samples have a feasible arm. "
-                "Check your outcome constraints."
-            )
+            raise ModelError(TS_NO_FEASIBLE_ARMS_ERROR)
 
         num_valid_samples = samples.shape[1]
         while num_valid_samples < self.num_samples:

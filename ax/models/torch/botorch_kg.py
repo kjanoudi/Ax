@@ -53,11 +53,16 @@ class KnowledgeGradient(BotorchModel):
     """
 
     def __init__(
-        self, cost_intercept: float = 1.0, linear_truncated: bool = True, **kwargs: Any
+        self,
+        cost_intercept: float = 1.0,
+        linear_truncated: bool = True,
+        use_input_warping: bool = False,
+        **kwargs: Any,
     ) -> None:
         super().__init__(
             best_point_recommender=recommend_best_out_of_sample_point,
             linear_truncated=linear_truncated,
+            use_input_warping=use_input_warping,
             **kwargs,
         )
         self.cost_intercept = cost_intercept
@@ -271,7 +276,10 @@ class KnowledgeGradient(BotorchModel):
             model_gen_options=model_gen_options,
             target_fidelities=target_fidelities,
         )
+        # pyre-fixme[16]: `Optional` has no attribute `detach`.
         recommended_point = recommended_point.detach().unsqueeze(0)
+        # ensure correct device (`best_point` always returns a CPU tensor)
+        recommended_point = recommended_point.to(device=self.device)
         # Extract acquisition value (TODO: Make this less painful and repetitive)
         if non_fixed_idcs is not None:
             recommended_point = recommended_point[..., non_fixed_idcs]

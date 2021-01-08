@@ -4,132 +4,116 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import numpy as np
 import torch
 from ax.models.torch.botorch_modular.utils import (
     choose_botorch_acqf_class,
-    choose_mll_class,
     choose_model_class,
     construct_acquisition_and_optimizer_options,
-    construct_training_data,
+    construct_single_training_data,
+    construct_training_data_list,
+    use_model_list,
 )
 from ax.utils.common.constants import Keys
 from ax.utils.common.testutils import TestCase
+from ax.utils.testing.torch_stubs import get_torch_test_data
 from botorch.acquisition.monte_carlo import qNoisyExpectedImprovement
 from botorch.models.gp_regression import FixedNoiseGP, SingleTaskGP
-from botorch.models.gp_regression_fidelity import SingleTaskMultiFidelityGP
-from botorch.models.model import Model
-from botorch.models.model_list_gp_regression import ModelListGP
+from botorch.models.gp_regression_fidelity import (
+    FixedNoiseMultiFidelityGP,
+    SingleTaskMultiFidelityGP,
+)
+from botorch.models.multitask import FixedNoiseMultiTaskGP, MultiTaskGP
 from botorch.utils.containers import TrainingData
-from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
-from gpytorch.mlls.sum_marginal_log_likelihood import SumMarginalLogLikelihood
 
 
 class BoTorchModelUtilsTest(TestCase):
     def setUp(self):
-        self.Xs = [torch.tensor([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]])]
-        self.Ys = [torch.tensor([[3.0], [4.0]])]
-        self.Yvars = [torch.tensor([[0.0], [2.0]])]
+        self.dtype = torch.float
+        self.Xs, self.Ys, self.Yvars, _, _, _, _ = get_torch_test_data(dtype=self.dtype)
+        self.Xs2, self.Ys2, self.Yvars2, _, _, _, _ = get_torch_test_data(
+            dtype=self.dtype, offset=1.0  # Making this data different.
+        )
+        # self.Xs = Xs1
+        # self.Ys = [torch.tensor([[3.0], [4.0]])]
+        # self.Yvars = [torch.tensor([[0.0], [2.0]])]
+        self.none_Yvars = [torch.tensor([[np.nan], [np.nan]])]
         self.task_features = []
 
-    def test_choose_model_class(self):
-        # Task features is not implemented yet.
-        with self.assertRaisesRegex(
-            NotImplementedError, "do not support `task_features`"
-        ):
-            choose_model_class(
-                Xs=self.Xs,
-                Ys=self.Ys,
-                Yvars=self.Yvars,
-                task_features=[1],
-                fidelity_features=[],
-            )
+    def test_choose_model_class_fidelity_features(self):
         # Only a single fidelity feature can be used.
         with self.assertRaisesRegex(
-            NotImplementedError, "only a single fidelity parameter"
+            NotImplementedError, "Only a single fidelity feature"
         ):
             choose_model_class(
-                Xs=self.Xs,
-                Ys=self.Ys,
-                Yvars=self.Yvars,
-                task_features=self.task_features,
-                fidelity_features=[1, 2],
+                Yvars=self.Yvars, task_features=[], fidelity_features=[1, 2]
             )
-        # With fidelity features, use SingleTaskMultiFidelityGP.
+        # No support for non-empty task & fidelity features yet.
+        with self.assertRaisesRegex(NotImplementedError, "Multi-task multi-fidelity"):
+            choose_model_class(
+                Yvars=self.Yvars, task_features=[1], fidelity_features=[1]
+            )
+        # With fidelity features and unknown variances, use SingleTaskMultiFidelityGP.
         self.assertEqual(
             SingleTaskMultiFidelityGP,
             choose_model_class(
-                Xs=self.Xs,
-                Ys=self.Ys,
-                Yvars=self.Yvars,
-                task_features=self.task_features,
-                fidelity_features=[2],
+                Yvars=self.none_Yvars, task_features=[], fidelity_features=[2]
             ),
         )
-        # Without fidelity features but with Yvar specifications, use FixedNoiseGP.
+        # With fidelity features and known variances, use FixedNoiseMultiFidelityGP.
         self.assertEqual(
-            FixedNoiseGP,
+            FixedNoiseMultiFidelityGP,
             choose_model_class(
-                Xs=self.Xs,
-                Ys=self.Ys,
-                Yvars=self.Yvars,
-                task_features=self.task_features,
-                fidelity_features=[],
+                Yvars=self.Yvars, task_features=[], fidelity_features=[2]
             ),
         )
-        # Without fidelity features and without Yvar specifications, use SingleTaskGP.
+
+    def test_choose_model_class_task_features(self):
+        # Only a single task feature can be used.
+        with self.assertRaisesRegex(NotImplementedError, "Only a single task feature"):
+            choose_model_class(
+                Yvars=self.Yvars, task_features=[1, 2], fidelity_features=[]
+            )
+        # With fidelity features and unknown variances, use SingleTaskMultiFidelityGP.
         self.assertEqual(
-            SingleTaskGP,
+            MultiTaskGP,
             choose_model_class(
-                Xs=self.Xs,
-                Ys=self.Ys,
-                Yvars=[torch.tensor([[float("nan")], [float("nan")]])],
-                task_features=self.task_features,
-                fidelity_features=[],
+                Yvars=self.none_Yvars, task_features=[1], fidelity_features=[]
             ),
         )
+        # With fidelity features and known variances, use FixedNoiseMultiFidelityGP.
+        self.assertEqual(
+            FixedNoiseMultiTaskGP,
+            choose_model_class(
+                Yvars=self.Yvars, task_features=[1], fidelity_features=[]
+            ),
+        )
+
+    def test_choose_model_class(self):
         # Mix of known and unknown variances.
         with self.assertRaisesRegex(
             ValueError, "Variances should all be specified, or none should be."
         ):
             choose_model_class(
-                Xs=self.Xs,
-                Ys=self.Ys,
-                Yvars=[torch.tensor([[0.0], [float("nan")]])],
-                task_features=self.task_features,
+                Yvars=[torch.tensor([[0.0], [np.nan]])],
+                task_features=[],
                 fidelity_features=[],
             )
-
-    def test_choose_mll_class(self):
-        # Use ExactMLL when `state_dict` is not None and `refit` is False.
+        # Without fidelity/task features but with Yvar specifications, use FixedNoiseGP.
         self.assertEqual(
-            ExactMarginalLogLikelihood,
-            choose_mll_class(
-                model_class=ModelListGP, state_dict={"non-empty": None}, refit=False
+            FixedNoiseGP,
+            choose_model_class(
+                Yvars=self.Yvars, task_features=[], fidelity_features=[]
             ),
         )
-
-        # Otherwise, when `state_dict` is None or `refit` is True:
-        # Use SumMLL when using a `ModelListGP`.
+        # W/out fidelity/task features and w/out Yvar specifications, use SingleTaskGP.
         self.assertEqual(
-            SumMarginalLogLikelihood,
-            choose_mll_class(
-                model_class=ModelListGP, state_dict={"non-empty": None}, refit=True
+            SingleTaskGP,
+            choose_model_class(
+                Yvars=[torch.tensor([[float("nan")], [float("nan")]])],
+                task_features=[],
+                fidelity_features=[],
             ),
-        )
-        self.assertEqual(
-            SumMarginalLogLikelihood,
-            choose_mll_class(model_class=ModelListGP, state_dict=None, refit=False),
-        )
-        # Use ExactMLL otherwise.
-        self.assertEqual(
-            ExactMarginalLogLikelihood,
-            choose_mll_class(
-                model_class=SingleTaskGP, state_dict={"non-empty": None}, refit=True
-            ),
-        )
-        self.assertEqual(
-            ExactMarginalLogLikelihood,
-            choose_mll_class(model_class=SingleTaskGP, state_dict=None, refit=False),
         )
 
     def test_choose_botorch_acqf_class(self):
@@ -158,20 +142,15 @@ class BoTorchModelUtilsTest(TestCase):
         )
         self.assertEqual(final_opt_options, optimizer_kwargs)
 
-    def test_construct_training_data(self):
+    def test_construct_single_training_data(self):
         # len(Xs) == len(Ys) == len(Yvars) == 1 case
         self.assertEqual(
-            construct_training_data(
-                Xs=self.Xs, Ys=self.Ys, Yvars=self.Yvars, model_class=SingleTaskGP
-            ),
+            construct_single_training_data(Xs=self.Xs, Ys=self.Ys, Yvars=self.Yvars),
             TrainingData(X=self.Xs[0], Y=self.Ys[0], Yvar=self.Yvars[0]),
         )
         # len(Xs) == len(Ys) == len(Yvars) > 1 case, batched multi-output
-        td = construct_training_data(
-            Xs=self.Xs * 2,
-            Ys=self.Ys * 2,
-            Yvars=self.Yvars * 2,
-            model_class=SingleTaskGP,
+        td = construct_single_training_data(
+            Xs=self.Xs * 2, Ys=self.Ys * 2, Yvars=self.Yvars * 2
         )
         expected = TrainingData(
             X=self.Xs[0],
@@ -181,9 +160,33 @@ class BoTorchModelUtilsTest(TestCase):
         self.assertTrue(torch.equal(td.X, expected.X))
         self.assertTrue(torch.equal(td.Y, expected.Y))
         self.assertTrue(torch.equal(td.Yvar, expected.Yvar))
-        # len(Xs) == len(Ys) == len(Yvars) > 1 case, not supporting batched
-        # multi-output (`Model` not a subclass of `BatchedMultiOutputGPyTorchModel`)
+        # len(Xs) == len(Ys) == len(Yvars) > 1 case with not all Xs equal,
+        # not supported and should go to `construct_training_data_list` instead.
         with self.assertRaisesRegex(ValueError, "Unexpected training data format"):
-            td = construct_training_data(
-                Xs=self.Xs * 2, Ys=self.Ys * 2, Yvars=self.Yvars * 2, model_class=Model
+            td = construct_single_training_data(
+                Xs=self.Xs + self.Xs2,  # Unequal Xs.
+                Ys=self.Ys * 2,
+                Yvars=self.Yvars * 2,
             )
+
+    def test_construct_training_data_list(self):
+        td_list = construct_training_data_list(
+            Xs=self.Xs + self.Xs2, Ys=self.Ys + self.Ys2, Yvars=self.Yvars + self.Yvars2
+        )
+        self.assertEqual(len(td_list), 2)
+        self.assertEqual(
+            td_list[0], TrainingData(X=self.Xs[0], Y=self.Ys[0], Yvar=self.Yvars[0])
+        )
+        self.assertEqual(
+            td_list[1], TrainingData(X=self.Xs2[0], Y=self.Ys2[0], Yvar=self.Yvars2[0])
+        )
+
+    def test_use_model_list(self):
+        self.assertFalse(use_model_list(Xs=self.Xs, botorch_model_class=SingleTaskGP))
+        self.assertFalse(  # Batched multi-output case.
+            use_model_list(Xs=self.Xs * 2, botorch_model_class=SingleTaskGP)
+        )
+        self.assertTrue(
+            use_model_list(Xs=self.Xs + self.Xs2, botorch_model_class=SingleTaskGP)
+        )
+        self.assertTrue(use_model_list(Xs=self.Xs, botorch_model_class=MultiTaskGP))

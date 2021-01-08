@@ -7,7 +7,7 @@
 import json
 import logging
 import warnings
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, TypeVar, Type
 
 import ax.service.utils.best_point as best_point_utils
 import numpy as np
@@ -26,6 +26,8 @@ from ax.core.types import (
     TParameterization,
     TParamValue,
 )
+from ax.exceptions.constants import CHOLESKY_ERROR_ANNOTATION
+from ax.exceptions.core import UnsupportedPlotError
 from ax.modelbridge.dispatch_utils import choose_generation_strategy
 from ax.modelbridge.generation_strategy import GenerationStrategy
 from ax.modelbridge.modelbridge_utils import get_pending_observation_features
@@ -47,6 +49,7 @@ from ax.storage.json_store.decoder import (
 )
 from ax.storage.json_store.encoder import object_to_json
 from ax.utils.common.docutils import copy_doc
+from ax.utils.common.executils import retry_on_exception
 from ax.utils.common.logger import _round_floats_for_logging, get_logger
 from ax.utils.common.typeutils import (
     checked_cast,
@@ -58,6 +61,9 @@ from botorch.utils.sampling import manual_seed
 
 
 logger = get_logger(__name__)
+
+
+AxClientSubclass = TypeVar("AxClientSubclass", bound="AxClient")
 
 
 class AxClient(WithDBSettingsBase):
@@ -275,6 +281,12 @@ class AxClient(WithDBSettingsBase):
             suppress_all_errors=self._suppress_storage_errors,
         )
 
+    @retry_on_exception(
+        logger=logger,
+        exception_types=(RuntimeError,),
+        suppress_all_errors=False,
+        wrap_error_message_in=CHOLESKY_ERROR_ANNOTATION,
+    )
     def get_next_trial(
         self, ttl_seconds: Optional[int] = None
     ) -> Tuple[TParameterization, int]:
@@ -294,6 +306,7 @@ class AxClient(WithDBSettingsBase):
         trial = self.experiment.new_trial(
             generator_run=self._gen_new_generator_run(), ttl_seconds=ttl_seconds
         )
+
         logger.info(
             f"Generated new trial {trial.index} with parameters "
             f"{_round_floats_for_logging(item=not_none(trial.arm).parameters)}."
@@ -304,9 +317,11 @@ class AxClient(WithDBSettingsBase):
             trial=trial,
             suppress_all_errors=self._suppress_storage_errors,
         )
+        # TODO[T79183560]: Ensure correct handling of generator run when using
+        # foreign keys.
         self._update_generation_strategy_in_db_if_possible(
             generation_strategy=self.generation_strategy,
-            new_generator_runs=trial.generator_runs,
+            new_generator_runs=[self.generation_strategy._generator_runs[-1]],
             suppress_all_errors=self._suppress_storage_errors,
         )
         return not_none(trial.arm).parameters, trial.index
@@ -353,14 +368,9 @@ class AxClient(WithDBSettingsBase):
         evaluations, data = self._make_evaluations_and_data(
             trial=trial, raw_data=raw_data, metadata=metadata, sample_sizes=sample_sizes
         )
+        self._validate_trial_data(trial=trial, data=data)
         trial._run_metadata = metadata or {}
-        for metric_name in data.df["metric_name"].values:
-            if metric_name not in self.experiment.metrics:
-                logger.info(
-                    f"Data was logged for metric {metric_name} that was not yet "
-                    "tracked on the experiment. Adding it as tracking metric."
-                )
-                self.experiment.add_tracking_metric(Metric(name=metric_name))
+
         self.experiment.attach_data(data=data)
         trial.mark_completed()
         data_for_logging = _round_floats_for_logging(
@@ -412,7 +422,9 @@ class AxClient(WithDBSettingsBase):
         evaluations, data = self._make_evaluations_and_data(
             trial=trial, raw_data=raw_data, metadata=metadata, sample_sizes=sample_sizes
         )
+        self._validate_trial_data(trial=trial, data=data)
         trial._run_metadata.update(metadata or {})
+
         # Registering trial data update is needed for generation strategies that
         # leverage the `update` functionality of model and bridge setup and therefore
         # need to be aware of new data added to experiment. Usually this happends
@@ -487,11 +499,6 @@ class AxClient(WithDBSettingsBase):
         """Retrieve the parameterization of the trial by the given index."""
         return not_none(self._get_trial(trial_index).arm).parameters
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Expected `Experiment` for 1st param
-    #  but got `(self: AxClient) -> Optional[Tuple[Dict[str, typing.Union[None, bool,
-    #  float, int, str]], Optional[Tuple[Dict[str, float], Optional[Dict[str,
-    #  typing.Dict[str, float]]]]]]]`.
     @copy_doc(best_point_utils.get_best_parameters)
     def get_best_parameters(
         self,
@@ -572,6 +579,7 @@ class AxClient(WithDBSettingsBase):
             title="Model performance vs. # of iterations",
             ylabel=objective_name.capitalize(),
             hover_labels=hover_labels,
+            model_transitions=self.generation_strategy.model_transitions,
         )
 
     def get_contour_plot(
@@ -650,7 +658,7 @@ class AxClient(WithDBSettingsBase):
                     "`predict`, so it cannot be used to generate a response "
                     "surface plot."
                 )
-        raise ValueError(
+        raise UnsupportedPlotError(
             f'Could not obtain contour plot of "{metric_name}" for parameters '
             f'"{param_x}" and "{param_y}", as a model with predictive ability, '
             "such as a Gaussian Process, has not yet been trained in the course "
@@ -790,16 +798,16 @@ class AxClient(WithDBSettingsBase):
             file.write(json.dumps(self.to_json_snapshot()))
             logger.info(f"Saved JSON-serialized state of optimization to `{filepath}`.")
 
-    @staticmethod
+    @classmethod
     def load_from_json_file(
-        filepath: str = "ax_client_snapshot.json", **kwargs
-    ) -> "AxClient":
+        cls: Type[AxClientSubclass], filepath: str = "ax_client_snapshot.json", **kwargs
+    ) -> AxClientSubclass:
         """Restore an `AxClient` and its state from a JSON-serialized snapshot,
         residing in a .json file by the given path.
         """
         with open(filepath, "r") as file:  # pragma: no cover
             serialized = json.loads(file.read())
-            return AxClient.from_json_snapshot(serialized=serialized, **kwargs)
+            return cls.from_json_snapshot(serialized=serialized, **kwargs)
 
     def to_json_snapshot(self) -> Dict[str, Any]:
         """Serialize this `AxClient` to JSON to be able to interrupt and restart
@@ -815,12 +823,14 @@ class AxClient(WithDBSettingsBase):
             "_enforce_sequential_optimization": self._enforce_sequential_optimization,
         }
 
-    @staticmethod
-    def from_json_snapshot(serialized: Dict[str, Any], **kwargs) -> "AxClient":
+    @classmethod
+    def from_json_snapshot(
+        cls: Type[AxClientSubclass], serialized: Dict[str, Any], **kwargs
+    ) -> AxClientSubclass:
         """Recreate an `AxClient` from a JSON snapshot."""
         experiment = object_from_json(serialized.pop("experiment"))
         serialized_generation_strategy = serialized.pop("generation_strategy")
-        ax_client = AxClient(
+        ax_client = cls(
             generation_strategy=generation_strategy_from_json(
                 generation_strategy_json=serialized_generation_strategy
             )
@@ -1017,6 +1027,15 @@ class AxClient(WithDBSettingsBase):
                     f"parameter on experiment be of type {typ}, set `value_type` "
                     f"on experiment creation for {p_name}."
                 )
+
+    def _validate_trial_data(self, trial: Trial, data: Data) -> None:
+        for metric_name in data.df["metric_name"].values:
+            if metric_name not in self.experiment.metrics:
+                logger.info(
+                    f"Data was logged for metric {metric_name} that was not yet "
+                    "tracked on the experiment. Adding it as tracking metric."
+                )
+                self.experiment.add_tracking_metric(Metric(name=metric_name))
 
     # -------- Backward-compatibility with old save / load method names. -------
 

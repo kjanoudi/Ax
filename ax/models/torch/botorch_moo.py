@@ -23,7 +23,12 @@ from ax.models.torch.botorch_defaults import (
     recommend_best_observed_point,
     scipy_optimizer,
 )
-from ax.models.torch.botorch_moo_defaults import get_EHVI, scipy_optimizer_list
+from ax.models.torch.botorch_moo_defaults import (
+    get_EHVI,
+    pareto_frontier_evaluator,
+    scipy_optimizer_list,
+)
+from ax.models.torch.frontier_utils import TFrontierEvaluator
 from ax.models.torch.utils import (
     _get_X_pending_and_observed,
     _to_inequality_constraints,
@@ -52,18 +57,6 @@ TOptimizerList = Callable[
         Any,
     ],
     Tuple[Tensor, Tensor],
-]
-TFrontierEvaluator = Callable[
-    [
-        TorchModel,  # TODO: MultiObjective
-        List[Tuple[float, float]],
-        Tensor,
-        Optional[Tuple[Tensor, Tensor]],
-        Optional[Tuple[Tensor, Tensor]],
-        Optional[Dict[int, float]],
-        Optional[TConfig],
-    ],
-    Optional[List[Tensor]],
 ]
 
 
@@ -162,6 +155,23 @@ class MultiObjectiveBotorchModel(BotorchModel):
     generation, and `rounding_func` is a callback that rounds an optimization
     result appropriately. `candidates` is a tensor of generated candidates.
     For additional details on the arguments, see `scipy_optimizer`.
+
+    ::
+
+        frontier_evaluator(
+            model,
+            objective_weights,
+            objective_thresholds,
+            X,
+            Y,
+            Yvar,
+            outcome_constraints,
+        )
+
+    Here `model` is a botorch `Model`, `objective_thresholds` is used in hypervolume
+    evaluations, `objective_weights` is a tensor of weights applied to the  objectives
+    (sign represents direction), `X`, `Y`, `Yvar` are tensors, `outcome_constraints` is
+    a tuple of tensors describing the (linear) outcome constraints.
     """
 
     dtype: Optional[torch.dtype]
@@ -188,9 +198,12 @@ class MultiObjectiveBotorchModel(BotorchModel):
         acqf_optimizer: TOptimizer = scipy_optimizer,
         # TODO: Remove best_point_recommender for botorch_moo. Used in modelbridge._gen.
         best_point_recommender: TBestPointRecommender = recommend_best_observed_point,
+        frontier_evaluator: TFrontierEvaluator = pareto_frontier_evaluator,
         refit_on_cv: bool = False,
         refit_on_update: bool = True,
         warm_start_refitting: bool = False,
+        use_input_warping: bool = False,
+        use_loocv_pseudo_likelihood: bool = False,
         **kwargs: Any,
     ) -> None:
         self.model_constructor = model_constructor
@@ -198,10 +211,13 @@ class MultiObjectiveBotorchModel(BotorchModel):
         self.acqf_constructor = acqf_constructor
         self.acqf_optimizer = acqf_optimizer
         self.best_point_recommender = best_point_recommender
+        self.frontier_evaluator = frontier_evaluator
         self._kwargs = kwargs
         self.refit_on_cv = refit_on_cv
         self.refit_on_update = refit_on_update
         self.warm_start_refitting = warm_start_refitting
+        self.use_input_warping = use_input_warping
+        self.use_loocv_pseudo_likelihood = use_loocv_pseudo_likelihood
         self.model: Optional[Model] = None
         self.Xs = []
         self.Ys = []
@@ -212,8 +228,6 @@ class MultiObjectiveBotorchModel(BotorchModel):
         self.fidelity_features: List[int] = []
         self.metric_names: List[str] = []
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `bounds` expected.
     @copy_doc(TorchModel.gen)
     def gen(
         self,
@@ -221,13 +235,13 @@ class MultiObjectiveBotorchModel(BotorchModel):
         bounds: List[Tuple[float, float]],
         objective_weights: Tensor,  # objective_directions
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
+        objective_thresholds: Optional[Tensor] = None,
         linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
         pending_observations: Optional[List[Tensor]] = None,
         model_gen_options: Optional[TConfig] = None,
         rounding_func: Optional[Callable[[Tensor], Tensor]] = None,
         target_fidelities: Optional[Dict[int, float]] = None,
-        ref_point: Optional[List[float]] = None,
     ) -> Tuple[Tensor, Tensor, TGenMetadata, Optional[List[TCandidateMetadata]]]:
         options = model_gen_options or {}
         acf_options = options.get("acquisition_function_kwargs", {})
@@ -303,14 +317,10 @@ class MultiObjectiveBotorchModel(BotorchModel):
                 **optimizer_options,
             )
         else:
-            if ref_point:
-                ref_point = torch.tensor(
-                    ref_point, dtype=self.dtype, device=self.device
-                )
             acquisition_function = self.acqf_constructor(  # pyre-ignore: [28]
                 model=model,
                 objective_weights=objective_weights,
-                ref_point=ref_point,
+                objective_thresholds=objective_thresholds,
                 outcome_constraints=outcome_constraints,
                 X_observed=X_observed,
                 X_pending=X_pending,

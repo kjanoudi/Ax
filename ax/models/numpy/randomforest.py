@@ -36,8 +36,6 @@ class RandomForest(NumpyModel):
         self.num_trees = num_trees
         self.models: List[RandomForestRegressor] = []
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `Xs` expected.
     @copy_doc(NumpyModel.fit)
     def fit(
         self,
@@ -62,14 +60,10 @@ class RandomForest(NumpyModel):
                 )
             )
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `X` expected.
     @copy_doc(NumpyModel.predict)
     def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         return _rf_predict(self.models, X)
 
-    # pyre-fixme[56]: While applying decorator
-    #  `ax.utils.common.docutils.copy_doc(...)`: Argument `X_test` expected.
     @copy_doc(NumpyModel.cross_validate)
     def cross_validate(
         self,
@@ -136,7 +130,8 @@ def _rf_predict(
     f = np.zeros((X.shape[0], len(models)))
     cov = np.zeros((X.shape[0], len(models), len(models)))
     for i, m in enumerate(models):
-        preds = np.vstack([tree.predict(X) for tree in m.estimators_])  # pyre-ignore
+        # pyre-fixme[16]: `RandomForestRegressor` has no attribute `estimators_`.
+        preds = np.vstack([tree.predict(X) for tree in m.estimators_])
         f[:, i] = preds.mean(0)
         cov[:, i, i] = preds.var(0)
     return f, cov

@@ -21,7 +21,9 @@ from ax.core.observation import (
     observations_from_data,
     separate_observations,
 )
-from ax.core.optimization_config import OptimizationConfig
+from ax.core.optimization_config import (
+    OptimizationConfig,
+)
 from ax.core.search_space import SearchSpace
 from ax.core.types import (
     TCandidateMetadata,
@@ -31,6 +33,7 @@ from ax.core.types import (
     TModelMean,
     TModelPredict,
 )
+from ax.modelbridge.modelbridge_utils import clamp_observation_features
 from ax.modelbridge.transforms.base import Transform
 from ax.modelbridge.transforms.cast import Cast
 from ax.utils.common.logger import get_logger
@@ -367,13 +370,11 @@ class ModelBridge(ABC):
 
     @property
     def model_space(self) -> SearchSpace:
-        """SearchSpace used to fit model.
-        """
+        """SearchSpace used to fit model."""
         return self._model_space
 
     def get_training_data(self) -> List[Observation]:
-        """A copy of the (untransformed) data with which the model was fit.
-        """
+        """A copy of the (untransformed) data with which the model was fit."""
         return deepcopy(self._training_data)
 
     @property
@@ -537,12 +538,17 @@ class ModelBridge(ABC):
             transforms=self._raw_transforms,
             transform_configs=self._transform_configs,
         )
-        self._update(observation_features=obs_feats, observation_data=obs_data)
+        self._update(
+            search_space=search_space,
+            observation_features=obs_feats,
+            observation_data=obs_data,
+        )
         self.fit_time += time.time() - t_update_start
         self.fit_time_since_gen += time.time() - t_update_start
 
     def _update(
         self,
+        search_space: SearchSpace,
         observation_features: List[ObservationFeatures],
         observation_data: List[ObservationData],
     ) -> None:
@@ -588,6 +594,7 @@ class ModelBridge(ABC):
         # Get modifiable versions
         if search_space is None:
             search_space = self._model_space
+        orig_search_space = search_space
         search_space = search_space.clone()
 
         if optimization_config is None:
@@ -634,6 +641,13 @@ class ModelBridge(ABC):
             )
             if best_obsf is not None:
                 best_obsf = t.untransform_observation_features([best_obsf])[0]
+
+        # Clamp the untransformed data to the original search space
+        observation_features = clamp_observation_features(
+            observation_features, orig_search_space
+        )
+        if best_obsf is not None:
+            best_obsf = clamp_observation_features([best_obsf], orig_search_space)[0]
 
         best_point_predictions = None
         try:
@@ -722,14 +736,19 @@ class ModelBridge(ABC):
         obs_feats, obs_data = separate_observations(
             observations=cv_training_data, copy=True
         )
+        search_space = self._model_space.clone()
         for t in self.transforms.values():
             obs_feats = t.transform_observation_features(obs_feats)
             obs_data = t.transform_observation_data(obs_data, obs_feats)
             cv_test_points = t.transform_observation_features(cv_test_points)
+            search_space = t.transform_search_space(search_space)
 
         # Apply terminal transform, and get predictions.
         cv_predictions = self._cross_validate(
-            obs_feats=obs_feats, obs_data=obs_data, cv_test_points=cv_test_points
+            search_space=search_space,
+            obs_feats=obs_feats,
+            obs_data=obs_data,
+            cv_test_points=cv_test_points,
         )
         # Apply reverse transforms, in reverse order
         for t in reversed(self.transforms.values()):
@@ -741,6 +760,7 @@ class ModelBridge(ABC):
 
     def _cross_validate(
         self,
+        search_space: SearchSpace,
         obs_feats: List[ObservationFeatures],
         obs_data: List[ObservationData],
         cv_test_points: List[ObservationFeatures],
@@ -807,6 +827,31 @@ class ModelBridge(ABC):
             "Feature importance not available for this model type"
         )
 
+    def transform_observation_data(
+        self, observation_data: List[ObservationData]
+    ) -> Any:
+        """Applies transforms to given observation features and returns them in the
+        model space.
+
+        Args:
+            observation_features: ObservationFeatures to be transformed.
+
+        Returns:
+            Transformed values. This could be e.g. a torch Tensor, depending
+            on the ModelBridge subclass.
+        """
+        obsd = deepcopy(observation_data)
+        for t in self.transforms.values():
+            obsd = t.transform_observation_data(obsd, [])
+        # Apply terminal transform and return
+        return self._transform_observation_data(obsd)
+
+    def _transform_observation_data(
+        self, observation_data: List[ObservationData]
+    ) -> Any:
+        """Apply terminal transform to given observation features and return result."""
+        raise NotImplementedError  # pragma: no cover
+
     def transform_observation_features(
         self, observation_features: List[ObservationFeatures]
     ) -> Any:
@@ -829,9 +874,32 @@ class ModelBridge(ABC):
     def _transform_observation_features(
         self, observation_features: List[ObservationFeatures]
     ) -> Any:
-        """Apply terminal transform to given observation features and return result.
-        """
+        """Apply terminal transform to given observation features and return result."""
         raise NotImplementedError  # pragma: no cover
+
+    def transform_optimization_config(
+        self,
+        optimization_config: OptimizationConfig,
+        fixed_features: ObservationFeatures,
+    ) -> Any:
+        """Applies transforms to given optimization config.
+
+        Args:
+            optimization_config: OptimizationConfig to transform.
+            fixed_features: features which should not be transformed.
+
+        Returns:
+            Transformed values. This could be e.g. a torch Tensor, depending
+            on the ModelBridge subclass.
+        """
+        optimization_config = optimization_config.clone()
+        for t in self.transforms.values():
+            optimization_config = t.transform_optimization_config(
+                optimization_config=optimization_config,
+                modelbridge=self,
+                fixed_features=fixed_features,
+            )
+        return optimization_config
 
 
 def unwrap_observation_data(observation_data: List[ObservationData]) -> TModelPredict:

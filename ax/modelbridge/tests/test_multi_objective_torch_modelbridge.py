@@ -7,21 +7,29 @@
 from unittest.mock import patch
 
 import numpy as np
-from ax.core.metric import Metric
-from ax.core.objective import MultiObjective
-from ax.core.optimization_config import OptimizationConfig
-from ax.core.outcome_constraint import ComparisonOp, OutcomeConstraint
-from ax.modelbridge.base import ModelBridge
+from ax.core.observation import ObservationFeatures
+from ax.core.outcome_constraint import ComparisonOp, ObjectiveThreshold
+from ax.modelbridge.modelbridge_utils import (
+    predicted_hypervolume,
+    predicted_pareto_frontier,
+    observed_hypervolume,
+    observed_pareto_frontier,
+)
 from ax.modelbridge.multi_objective_torch import MultiObjectiveTorchModelBridge
 from ax.modelbridge.transforms.base import Transform
 from ax.models.torch.botorch_moo import MultiObjectiveBotorchModel
+from ax.models.torch.botorch_moo_defaults import pareto_frontier_evaluator
 from ax.utils.common.testutils import TestCase
 from ax.utils.testing.core_stubs import (
     get_branin_data_multi_objective,
     get_branin_experiment_with_multi_objective,
-    get_branin_metric,
-    get_multi_type_experiment,
 )
+
+
+PARETO_FRONTIER_EVALUATOR_PATH = (
+    f"{pareto_frontier_evaluator.__module__}.pareto_frontier_evaluator"
+)
+STUBS_PATH = get_branin_experiment_with_multi_objective.__module__
 
 
 # Prepare mock transforms
@@ -111,42 +119,38 @@ class t2(Transform):
 
 class MultiObjectiveTorchModelBridgeTest(TestCase):
     @patch(
-        f"{ModelBridge.__module__}.unwrap_observation_data",
-        autospec=True,
-        return_value=(2, 2),
+        # Mocking `BraninMetric` as not available while running, so it will
+        # be grabbed from cache during `fetch_data`.
+        f"{STUBS_PATH}.BraninMetric.is_available_while_running",
+        return_value=False,
     )
-    @patch(
-        f"{ModelBridge.__module__}.ModelBridge.predict",
-        autospec=True,
-        return_value=({"m": [1.0]}, {"m": {"m": [2.0]}}),
-    )
-    @patch(
-        (
-            f"{MultiObjectiveTorchModelBridge.__module__}."
-            "MultiObjectiveTorchModelBridge._fit"
-        ),
-        autospec=True,
-    )
-    def test_transform_ref_point(self, _mock_fit, _mock_predict, _mock_unwrap):
-        exp = get_branin_experiment_with_multi_objective(
-            has_optimization_config=True, with_batch=False
-        )
-        metrics = exp.optimization_config.objective.metrics
-        ref_point = {metrics[0].name: 0.0, metrics[1].name: 0.0}
-        modelbridge = MultiObjectiveTorchModelBridge(
-            search_space=exp.search_space,
-            model=MultiObjectiveBotorchModel(),
-            optimization_config=exp.optimization_config,
-            transforms=[t1, t2],
-            experiment=exp,
-            data=exp.fetch_data(),
-            ref_point=ref_point,
-        )
-        self.assertIsNone(modelbridge._transformed_ref_point)
+    def test_pareto_frontier(self, _):
         exp = get_branin_experiment_with_multi_objective(
             has_optimization_config=True, with_batch=True
         )
-        exp.attach_data(get_branin_data_multi_objective(trial_indices=exp.trials))
+        for trial in exp.trials.values():
+            trial.mark_running(no_runner_required=True).mark_completed()
+        metrics_dict = exp.optimization_config.metrics
+        objective_thresholds = [
+            ObjectiveThreshold(
+                metric=metrics_dict["branin_a"],
+                bound=0.0,
+                relative=False,
+                op=ComparisonOp.GEQ,
+            ),
+            ObjectiveThreshold(
+                metric=metrics_dict["branin_b"],
+                bound=0.0,
+                relative=False,
+                op=ComparisonOp.GEQ,
+            ),
+        ]
+        exp.optimization_config = exp.optimization_config.clone_with_args(
+            objective_thresholds=objective_thresholds
+        )
+        exp.attach_data(
+            get_branin_data_multi_objective(trial_indices=exp.trials.keys())
+        )
         modelbridge = MultiObjectiveTorchModelBridge(
             search_space=exp.search_space,
             model=MultiObjectiveBotorchModel(),
@@ -154,43 +158,103 @@ class MultiObjectiveTorchModelBridgeTest(TestCase):
             transforms=[t1, t2],
             experiment=exp,
             data=exp.fetch_data(),
-            ref_point=ref_point,
+            objective_thresholds=objective_thresholds,
         )
-        self.assertIsNotNone(modelbridge._transformed_ref_point)
-        self.assertEqual(2, len(modelbridge._transformed_ref_point))
+        with patch(
+            PARETO_FRONTIER_EVALUATOR_PATH, wraps=pareto_frontier_evaluator
+        ) as wrapped_frontier_evaluator:
+            modelbridge.model.frontier_evaluator = wrapped_frontier_evaluator
+            observed_frontier_data = observed_pareto_frontier(
+                modelbridge=modelbridge, objective_thresholds=objective_thresholds
+            )
+            wrapped_frontier_evaluator.assert_called_once()
+            self.assertEqual(1, len(observed_frontier_data))
 
-        mixed_objective_constraints_optimization_config = OptimizationConfig(
-            objective=MultiObjective(
-                metrics=[get_branin_metric(name="branin_b")], minimize=False
+        with self.assertRaises(ValueError):
+            predicted_pareto_frontier(
+                modelbridge=modelbridge,
+                objective_thresholds=objective_thresholds,
+                observation_features=[],
+            )
+
+        observation_features = [
+            ObservationFeatures(parameters={"x1": 0.0, "x2": 1.0}),
+            ObservationFeatures(parameters={"x1": 1.0, "x2": 0.0}),
+        ]
+        predicted_frontier_data = predicted_pareto_frontier(
+            modelbridge=modelbridge,
+            objective_thresholds=objective_thresholds,
+            observation_features=observation_features,
+        )
+        self.assertTrue(len(predicted_frontier_data) <= 2)
+
+    @patch(
+        # Mocking `BraninMetric` as not available while running, so it will
+        # be grabbed from cache during `fetch_data`.
+        f"{STUBS_PATH}.BraninMetric.is_available_while_running",
+        return_value=False,
+    )
+    def test_hypervolume(self, _):
+        exp = get_branin_experiment_with_multi_objective(
+            has_optimization_config=True, with_batch=True
+        )
+        for trial in exp.trials.values():
+            trial.mark_running(no_runner_required=True).mark_completed()
+        metrics_dict = exp.optimization_config.metrics
+        objective_thresholds = [
+            ObjectiveThreshold(
+                metric=metrics_dict["branin_a"],
+                bound=0.0,
+                relative=False,
+                op=ComparisonOp.GEQ,
             ),
-            outcome_constraints=[
-                OutcomeConstraint(
-                    metric=Metric(name="branin_a"), op=ComparisonOp.LEQ, bound=1
-                )
-            ],
+            ObjectiveThreshold(
+                metric=metrics_dict["branin_b"],
+                bound=0.0,
+                relative=False,
+                op=ComparisonOp.GEQ,
+            ),
+        ]
+        optimization_config = exp.optimization_config.clone_with_args(
+            objective_thresholds=objective_thresholds
+        )
+        exp.attach_data(
+            get_branin_data_multi_objective(trial_indices=exp.trials.keys())
         )
         modelbridge = MultiObjectiveTorchModelBridge(
             search_space=exp.search_space,
             model=MultiObjectiveBotorchModel(),
-            optimization_config=mixed_objective_constraints_optimization_config,
+            optimization_config=optimization_config,
             transforms=[t1, t2],
             experiment=exp,
             data=exp.fetch_data(),
-            ref_point={"branin_b": 0.0},
+            objective_thresholds=objective_thresholds,
         )
-        self.assertEqual({"branin_a", "branin_b"}, modelbridge._metric_names)
-        self.assertEqual(["branin_b"], modelbridge._objective_metric_names)
-        self.assertIsNotNone(modelbridge._transformed_ref_point)
-        self.assertEqual(1, len(modelbridge._transformed_ref_point))
-
-    def test_multi_type_experiment(self):
-        exp = get_multi_type_experiment()
-        with self.assertRaises(NotImplementedError):
-            MultiObjectiveTorchModelBridge(
-                experiment=exp,
-                search_space=exp.search_space,
-                model=MultiObjectiveBotorchModel(),
-                transforms=[],
-                data=exp.fetch_data(),
-                ref_point={"branin_b": 0.0},
+        with patch(
+            PARETO_FRONTIER_EVALUATOR_PATH, wraps=pareto_frontier_evaluator
+        ) as wrapped_frontier_evaluator:
+            modelbridge.model.frontier_evaluator = wrapped_frontier_evaluator
+            hv = observed_hypervolume(
+                modelbridge=modelbridge, objective_thresholds=objective_thresholds
             )
+            expected_hv = 25  # (5 - 0) * (5 - 0)
+            wrapped_frontier_evaluator.assert_called_once()
+            self.assertEqual(expected_hv, hv)
+
+        with self.assertRaises(ValueError):
+            predicted_hypervolume(
+                modelbridge=modelbridge,
+                objective_thresholds=objective_thresholds,
+                observation_features=[],
+            )
+
+        observation_features = [
+            ObservationFeatures(parameters={"x1": 1.0, "x2": 2.0}),
+            ObservationFeatures(parameters={"x1": 2.0, "x2": 1.0}),
+        ]
+        predicted_hv = predicted_hypervolume(
+            modelbridge=modelbridge,
+            objective_thresholds=objective_thresholds,
+            observation_features=observation_features,
+        )
+        self.assertTrue(predicted_hv >= 0)

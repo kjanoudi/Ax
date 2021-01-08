@@ -46,9 +46,8 @@ class OneHotEncoder:
     @property
     def classes(self) -> np.ndarray:
         """Return number of classes discovered while fitting transform."""
-        return (
-            self.label_binarizer.classes_  # pyre-ignore[16]: missing attribute classes_
-        )
+        # pyre-fixme[16]: `LabelBinarizer` has no attribute `classes_`.
+        return self.label_binarizer.classes_
 
 
 class OneHot(Transform):

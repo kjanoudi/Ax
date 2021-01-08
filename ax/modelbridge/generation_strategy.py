@@ -16,7 +16,7 @@ from ax.core.base_trial import BaseTrial, TrialStatus
 from ax.core.data import Data
 from ax.core.experiment import Experiment
 from ax.core.generator_run import GeneratorRun
-from ax.exceptions.core import DataRequiredError
+from ax.exceptions.core import DataRequiredError, NoDataError
 from ax.exceptions.generation_strategy import (
     GenerationStrategyCompleted,
     MaxParallelismReachedException,
@@ -24,14 +24,12 @@ from ax.exceptions.generation_strategy import (
 from ax.modelbridge.base import ModelBridge
 from ax.modelbridge.registry import (
     Models,
+    ModelRegistryBase,
     _combine_model_kwargs_and_state,
     get_model_from_generator_run,
 )
-from ax.utils.common.equality import (
-    Base,
-    equality_typechecker,
-    object_attribute_dicts_equal,
-)
+from ax.utils.common.base import Base
+from ax.utils.common.equality import equality_typechecker, object_attribute_dicts_equal
 from ax.utils.common.kwargs import consolidate_kwargs, get_function_argument_names
 from ax.utils.common.logger import _round_floats_for_logging, get_logger
 from ax.utils.common.typeutils import checked_cast, not_none
@@ -106,7 +104,7 @@ class GenerationStep(NamedTuple):
 
     """
 
-    model: Union[Models, Callable[..., ModelBridge]]
+    model: Union[ModelRegistryBase, Callable[..., ModelBridge]]
     num_trials: int
     min_trials_observed: int = 0
     max_parallelism: Optional[int] = None
@@ -123,8 +121,8 @@ class GenerationStep(NamedTuple):
     def model_name(self) -> str:
         # Model can be defined as member of Models enum or as a factory function,
         # so we use Models member (str) value if former and function name if latter.
-        if isinstance(self.model, Models):
-            return checked_cast(str, checked_cast(Models, self.model).value)
+        if isinstance(self.model, ModelRegistryBase):
+            return checked_cast(str, checked_cast(ModelRegistryBase, self.model).value)
         if callable(self.model):
             return self.model.__name__  # pyre-fixme[16]: union has no attr __name__
         raise TypeError(  # pragma: no cover
@@ -164,7 +162,6 @@ class GenerationStrategy(Base):
     # Experiment, for which this generation strategy has generated trials, if
     # it exists.
     _experiment: Optional[Experiment] = None
-    _db_id: Optional[int] = None  # Used when storing to DB.
     # Trial indices as last seen by the model; updated in `_model` property setter.
     _seen_trial_indices_by_status = None
     _model: Optional[ModelBridge] = None  # Current model.
@@ -188,7 +185,7 @@ class GenerationStrategy(Base):
             elif step.num_trials < 1:  # pragma: no cover
                 raise ValueError("`num_trials` must be positive or -1 for all models.")
             self._steps[idx] = step._replace(index=idx)
-            if not isinstance(step.model, Models):
+            if not isinstance(step.model, ModelRegistryBase):
                 self._uses_registered_models = False
         if not self._uses_registered_models:
             logger.info(
@@ -324,7 +321,7 @@ class GenerationStrategy(Base):
         )
 
     @property
-    def num_running_trials_for_current_step(self) -> int:
+    def num_running_trials_this_step(self) -> int:
         """Number of trials in status `RUNNING` for the current generation step
         of this strategy.
         """
@@ -337,6 +334,37 @@ class GenerationStrategy(Base):
                 num_running += 1
         return num_running
 
+    @property
+    def num_can_complete_this_step(self) -> int:
+        """Number of trials for the current step in generation strategy that can
+        be completed (so are not in status `FAILED` or `ABANDONED`). Used to keep
+        track of how many generator runs (that become trials) can be produced
+        from the current generation step.
+
+        NOTE: This includes `COMPLETED` trials.
+        """
+        step_trials = self.trial_indices_by_step[self._curr.index]
+        by_status = self.experiment.trial_indices_by_status
+        # Number of trials that will not be `COMPLETED`, used to avoid counting
+        # unsuccessfully terminated trials against the number of generated trials
+        # during determination of whether enough trials have been generated and
+        # completed to proceed to the next generation step.
+        num_will_not_complete = len(
+            step_trials.intersection(
+                by_status[TrialStatus.FAILED].union(by_status[TrialStatus.ABANDONED])
+            )
+        )
+        return len(step_trials) - num_will_not_complete
+
+    @property
+    def num_completed_this_step(self) -> int:
+        """Number of trials in status `COMPLETD` for the current generation step
+        of this strategy.
+        """
+        step_trials = self.trial_indices_by_step[self._curr.index]
+        by_status = self.experiment.trial_indices_by_status
+        return len(step_trials.intersection(by_status[TrialStatus.COMPLETED]))
+
     def gen(
         self,
         experiment: Experiment,
@@ -347,6 +375,11 @@ class GenerationStrategy(Base):
         """Produce the next points in the experiment. Additional kwargs passed to
         this method are propagated directly to the underlying model's `gen`, along
         with the `model_gen_kwargs` set on the current generation step.
+
+        NOTE: Each generator run returned from this function must become a single
+        trial on the experiment to comply with assumptions made in generation
+        strategy. Do not split one generator run produced from generation strategy
+        into multiple trials (never making a generator run into a trial is allowed).
 
         Args:
             experiment: Experiment, for which the generation strategy is producing
@@ -365,28 +398,9 @@ class GenerationStrategy(Base):
                 case this method will also output a generator run with number of
                 arms that can differ from `n`.
         """
-        self.experiment = experiment
-        self._set_or_update_model(data=data)
-        self._save_seen_trial_indices()
-        max_parallelism = self._curr.max_parallelism
-        num_running = self.num_running_trials_for_current_step
-        if max_parallelism is not None and num_running >= max_parallelism:
-            raise MaxParallelismReachedException(
-                step_index=self._curr.index,
-                model_name=self._curr.model_name,
-                num_running=num_running,
-            )
-        model = not_none(self.model)
-        generator_run = model.gen(
-            n=n,
-            **consolidate_kwargs(
-                kwargs_iterable=[self._curr.model_gen_kwargs, kwargs],
-                keywords=get_function_argument_names(model.gen),
-            ),
-        )
-        generator_run._generation_step_index = self._curr.index
-        self._generator_runs.append(generator_run)
-        return generator_run
+        return self._gen_multiple(
+            experiment=experiment, num_generator_runs=1, data=data, n=n, **kwargs
+        )[0]
 
     def clone_reset(self) -> "GenerationStrategy":
         """Copy this generation strategy without it's state."""
@@ -406,6 +420,84 @@ class GenerationStrategy(Base):
         repr += "])"
         return repr
 
+    # ------------------------- Candidate generation helpers. -------------------------
+
+    def _gen_multiple(
+        self,
+        experiment: Experiment,
+        num_generator_runs: int,
+        data: Optional[Data] = None,
+        n: int = 1,
+        **kwargs: Any,
+    ) -> List[GeneratorRun]:
+        """Produce multiple generator runs at once, to be made into multiple
+        trials on the experiment.
+
+        NOTE: This is used to ensure that maximum paralellism and number
+        of trials per step are not violated when producing many generator
+        runs from this generation strategy in a row. Without this function,
+        if one generates multiple generator runs without first making any
+        of them into running trials, generation strategy cannot enforce that it only
+        produces as many generator runs as are allowed by the paralellism
+        limit and the limit on number of trials in current step.
+        """
+        self.experiment = experiment
+        self._set_or_update_model(data=data)
+        self._save_seen_trial_indices()
+        max_parallelism = self._curr.max_parallelism
+        num_running = self.num_running_trials_this_step
+
+        # Make sure to not make too many generator runs and
+        # exceed maximum allowed paralellism for the step.
+        if max_parallelism is not None:
+            if num_running >= max_parallelism:
+                raise MaxParallelismReachedException(
+                    step_index=self._curr.index,
+                    model_name=self._curr.model_name,
+                    num_running=num_running,
+                )
+            else:
+                num_generator_runs = min(
+                    num_generator_runs, max_parallelism - num_running
+                )
+
+        # Make sure not to extend number of trials expected in step.
+        if self._curr.enforce_num_trials and self._curr.num_trials > 0:
+            num_generator_runs = min(
+                num_generator_runs,
+                self._curr.num_trials - self.num_can_complete_this_step,
+            )
+
+        model = not_none(self.model)
+        # TODO[T79183560]: Cloning generator runs here is a temporary measure
+        # to ensure a 1-to-1 correspondence between user-facing generator runs
+        # and their stored SQL counterparts. This will be no longer needed soon
+        # as we move to use foreign keys to avoid storing generotor runs on both
+        # experiment and generation strategy like we do now.
+        generator_run_clones = []
+        for _ in range(num_generator_runs):
+            try:
+                generator_run = model.gen(
+                    n=n,
+                    **consolidate_kwargs(
+                        kwargs_iterable=[self._curr.model_gen_kwargs, kwargs],
+                        keywords=get_function_argument_names(model.gen),
+                    ),
+                )
+                generator_run._generation_step_index = self._curr.index
+                self._generator_runs.append(generator_run)
+                generator_run_clones.append(generator_run.clone())
+            except DataRequiredError as err:
+                # Model needs more data, so we log the error and return
+                # as many generator runs as we were able to produce, unless
+                # no trials were produced at all (in which case its safe to raise).
+                if len(generator_run_clones) == 0:
+                    raise
+                logger.debug(f"Model required more data: {err}.")
+                break
+
+        return generator_run_clones
+
     # ------------------------- Model selection logic helpers. -------------------------
 
     def _set_or_update_model(self, data: Optional[Data]) -> None:
@@ -414,23 +506,8 @@ class GenerationStrategy(Base):
             return
 
         # Not unlimited trials => determine whether to transition to next model.
-        step_trials = self.trial_indices_by_step[self._curr.index]
-        by_status = self.experiment.trial_indices_by_status
-        num_completed = len(step_trials.intersection(by_status[TrialStatus.COMPLETED]))
-        # Number of trials that will not be `COMPLETED`, used to avoid counting
-        # unsuccessfully terminated trials against the number of generated trials
-        # during determination of whether enough trials have been generated and
-        # completed to proceed to the next generation step.
-        num_will_not_complete = len(
-            step_trials.intersection(
-                by_status[TrialStatus.FAILED].union(by_status[TrialStatus.ABANDONED])
-            )
-        )
-
-        enough_observed = num_completed >= self._curr.min_trials_observed
-        enough_generated = (
-            len(step_trials) - num_will_not_complete >= self._curr.num_trials
-        )
+        enough_generated = self.num_can_complete_this_step >= self._curr.num_trials
+        enough_observed = self.num_completed_this_step >= self._curr.min_trials_observed
 
         # Check that minimum observed_trials is satisfied if it's enforced.
         if self._curr.enforce_num_trials and enough_generated and not enough_observed:
@@ -463,8 +540,7 @@ class GenerationStrategy(Base):
             self._set_current_model(data=data)
 
     def _set_current_model(self, data: Optional[Data]) -> None:
-        """Instantiate the current model with all available data.
-        """
+        """Instantiate the current model with all available data."""
         model_kwargs = self._curr.model_kwargs or {}
 
         # If last generator run's index matches the current step, extract
@@ -482,7 +558,6 @@ class GenerationStrategy(Base):
                 model_class=not_none(not_none(self.model).model.__class__),
             )
 
-        # TODO[T65857344]: move from fetching all data to using cached data
         if data is None:
             if self._curr.use_update:
                 # If the new step is using `update`, it's important to instantiate
@@ -493,12 +568,42 @@ class GenerationStrategy(Base):
                 # implement `fetch_experiment_data`). We avoid fetching data for
                 # trials with statuses other than `COMPLETED`, by fetching specifically
                 # for `COMPLETED` trials.
+                avail_while_running_metrics = {
+                    m.name
+                    for m in self.experiment.metrics.values()
+                    if m.is_available_while_running()
+                }
+                if avail_while_running_metrics:
+                    raise NotImplementedError(
+                        f"Metrics {avail_while_running_metrics} are available while "
+                        "trial is running, but use of `update` functionality in "
+                        "generation strategy relies on new data being available upon "
+                        "trial completion."
+                    )
                 data = self.experiment.fetch_trials_data(
                     self.experiment.trial_indices_by_status[TrialStatus.COMPLETED]
                 )
             else:
                 data = self.experiment.fetch_data()
-        if isinstance(self._curr.model, Models):
+        # By the time we get here, we will have already transitioned
+        # to a new step, but if previou step required observed data,
+        # we should raise an error even if enough trials were completed.
+        # Such an empty data case does indicate an invalid state; this
+        # check is to improve the experience of detecting and debugging
+        # the invalid state that led to this.
+        previous_step_required_observations = (
+            self._curr.index > 0
+            and self._steps[self._curr.index - 1].min_trials_observed > 0
+        )
+        if data.df.empty and previous_step_required_observations:
+            raise NoDataError(
+                f"Observed data is required for generation step #{self._curr.index} "
+                f"(model {self._curr.model_name}), but fetched data was empty. "
+                "Something is wrong with experiment setup -- likely metrics do not "
+                "implement fetching logic (check your metrics) or no data was "
+                "attached to experiment for completed trials."
+            )
+        if isinstance(self._curr.model, ModelRegistryBase):
             self._set_current_model_from_models_enum(data=data, **model_kwargs)
         else:
             # If model was not specified as Models member, it was specified as a
@@ -563,7 +668,7 @@ class GenerationStrategy(Base):
         )
 
     def _restore_model_from_generator_run(
-        self, models_enum: Optional[Type[Models]] = None
+        self, models_enum: Optional[Type[ModelRegistryBase]] = None
     ) -> None:
         """Reinstantiates the most recent model on this generation strategy
         from the last generator run it produced.
@@ -583,6 +688,8 @@ class GenerationStrategy(Base):
             models_enum=models_enum,
         )
         self._save_seen_trial_indices()
+
+    # ------------------------- State-tracking helpers. -------------------------
 
     def _save_seen_trial_indices(self) -> None:
         """Saves Experiment's `trial_indices_by_status` at the time of the model's

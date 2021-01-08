@@ -371,10 +371,6 @@ class SQAGenerationStrategy(Base):
         order_by=lambda: SQAGeneratorRun.id,
     )
 
-    data: SQAData = relationship(
-        "SQAData", cascade="all, delete-orphan", lazy=False, uselist=False
-    )
-
 
 class SQATrial(Base):
     __tablename__: str = "trial_v2"
@@ -395,8 +391,8 @@ class SQATrial(Base):
     num_arms_created: int = Column(Integer, nullable=False, default=0)
     # pyre-fixme[8]: Attribute has type `Optional[bool]`; used as `Column[bool]`.
     optimize_for_power: Optional[bool] = Column(Boolean)
-    # pyre-fixme[8]: Attribute has type `Optional[int]`; used as `Column[bool]`.
-    ttl_seconds: Optional[int] = Column(Boolean)
+    # pyre-fixme[8]: Attribute has type `Optional[int]`; used as `Column[int]`.
+    ttl_seconds: Optional[int] = Column(Integer)
     # pyre-fixme[8]: Attribute has type `Optional[Dict[str, typing.Any]]`; used as
     #  `Column[typing.Any]`.
     run_metadata: Optional[Dict[str, Any]] = Column(JSONEncodedTextDict)
@@ -498,9 +494,9 @@ class SQAExperiment(Base):
     )
     generation_strategy: Optional[SQAGenerationStrategy] = relationship(
         "SQAGenerationStrategy",
-        backref=backref("experiment", lazy=False),
+        backref=backref("experiment", lazy=True),
         uselist=False,
-        lazy="selectin",
+        lazy=True,
     )
 
     immutable_fields = ["name"]

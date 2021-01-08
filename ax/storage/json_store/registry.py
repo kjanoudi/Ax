@@ -18,8 +18,11 @@ from ax.core.generator_run import GeneratorRun
 from ax.core.metric import Metric
 from ax.core.multi_type_experiment import MultiTypeExperiment
 from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
-from ax.core.optimization_config import OptimizationConfig
-from ax.core.outcome_constraint import OutcomeConstraint
+from ax.core.optimization_config import (
+    MultiObjectiveOptimizationConfig,
+    OptimizationConfig,
+)
+from ax.core.outcome_constraint import ObjectiveThreshold, OutcomeConstraint
 from ax.core.parameter import (
     ChoiceParameter,
     FixedParameter,
@@ -44,6 +47,7 @@ from ax.modelbridge.factory import Models
 from ax.modelbridge.generation_strategy import GenerationStep, GenerationStrategy
 from ax.modelbridge.transforms.base import Transform
 from ax.models.torch.botorch_modular.acquisition import Acquisition
+from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
 from ax.models.torch.botorch_modular.model import BoTorchModel
 from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.runners.synthetic import SyntheticRunner
@@ -62,6 +66,7 @@ from ax.storage.json_store.encoders import (
     generation_strategy_to_dict,
     generator_run_to_dict,
     metric_to_dict,
+    multi_objective_optimization_config_to_dict,
     multi_objective_to_dict,
     multi_type_experiment_to_dict,
     objective_to_dict,
@@ -103,13 +108,16 @@ ENCODER_REGISTRY: Dict[Type, Callable[[Any], Dict[str, Any]]] = {
     GenerationStrategy: generation_strategy_to_dict,
     GeneratorRun: generator_run_to_dict,
     Hartmann6Metric: metric_to_dict,
+    ListSurrogate: surrogate_to_dict,
     L2NormMetric: metric_to_dict,
     Metric: metric_to_dict,
     MultiObjective: multi_objective_to_dict,
+    MultiObjectiveOptimizationConfig: multi_objective_optimization_config_to_dict,
     MultiTypeExperiment: multi_type_experiment_to_dict,
     NegativeBraninMetric: metric_to_dict,
     NoisyFunctionMetric: metric_to_dict,
     Objective: objective_to_dict,
+    ObjectiveThreshold: outcome_constraint_to_dict,
     OptimizationConfig: optimization_config_to_dict,
     OrderConstraint: order_parameter_constraint_to_dict,
     OutcomeConstraint: outcome_constraint_to_dict,
@@ -160,14 +168,17 @@ DECODER_REGISTRY: Dict[str, Type] = {
     "GeneratorRun": GeneratorRun,
     "GeneratorRunStruct": GeneratorRunStruct,
     "Hartmann6Metric": Hartmann6Metric,
+    "ListSurrogate": ListSurrogate,
     "L2NormMetric": L2NormMetric,
     "Metric": Metric,
     "Models": Models,
     "MultiObjective": MultiObjective,
+    "MultiObjectiveOptimizationConfig": MultiObjectiveOptimizationConfig,
     "MultiTypeExperiment": MultiTypeExperiment,
     "NegativeBraninMetric": NegativeBraninMetric,
     "NoisyFunctionMetric": NoisyFunctionMetric,
     "Objective": Objective,
+    "ObjectiveThreshold": ObjectiveThreshold,
     "OptimizationConfig": OptimizationConfig,
     "OrderConstraint": OrderConstraint,
     "OutcomeConstraint": OutcomeConstraint,

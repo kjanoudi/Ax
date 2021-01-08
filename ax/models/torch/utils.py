@@ -271,7 +271,7 @@ def _to_inequality_constraints(
         inequality_constraints = []
         k, d = A.shape
         for i in range(k):
-            indicies = A[i, :].nonzero().squeeze()
+            indicies = A[i, :].nonzero(as_tuple=False).squeeze()
             coefficients = -A[i, indicies]
             rhs = -b[i, 0]
             inequality_constraints.append((indicies, coefficients, rhs))
@@ -336,7 +336,7 @@ def get_botorch_objective(
         return ConstrainedMCObjective(
             objective=obj_tf, constraints=con_tfs or [], infeasible_cost=inf_cost
         )
-    if use_scalarized_objective:
+    elif use_scalarized_objective:
         return ScalarizedObjective(weights=objective_weights)
     return LinearMCObjective(weights=objective_weights)
 

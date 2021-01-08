@@ -7,17 +7,22 @@
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
-from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
 from ax.core.observation import ObservationData, ObservationFeatures
-from ax.core.optimization_config import OptimizationConfig
-from ax.core.outcome_constraint import ComparisonOp, OutcomeConstraint
+from ax.core.optimization_config import (
+    OptimizationConfig,
+)
 from ax.core.search_space import SearchSpace
-from ax.core.types import TBounds, TCandidateMetadata, TConfig, TGenMetadata
+from ax.core.types import TCandidateMetadata, TConfig, TGenMetadata
 from ax.modelbridge.base import ModelBridge
 from ax.modelbridge.modelbridge_utils import (
+    array_to_observation_data,
+    extract_objective_weights,
+    extract_outcome_constraints,
     extract_parameter_constraints,
     get_bounds_and_task,
     get_fixed_features,
+    observation_data_to_array,
+    observation_features_to_array,
     parse_observation_features,
     pending_observations_as_array,
     transform_callback,
@@ -97,8 +102,7 @@ class ArrayModelBridge(ModelBridge):
         fidelity_features: List[int],
         candidate_metadata: Optional[List[List[TCandidateMetadata]]],
     ) -> None:
-        """Fit the model, given numpy types.
-        """
+        """Fit the model, given numpy types."""
         self.model = model
         self.model.fit(
             Xs=Xs,
@@ -114,6 +118,7 @@ class ArrayModelBridge(ModelBridge):
 
     def _update(
         self,
+        search_space: SearchSpace,
         observation_features: List[ObservationFeatures],
         observation_data: List[ObservationData],
     ) -> None:
@@ -124,12 +129,23 @@ class ArrayModelBridge(ModelBridge):
             outcomes=self.outcomes,
             parameters=self.parameters,
         )
+
+        bounds, task_features, target_fidelities = get_bounds_and_task(
+            search_space=search_space, param_names=self.parameters
+        )
+
         # Update in-design status for these new points.
         self._model_update(
             Xs=Xs_array,
             Ys=Ys_array,
             Yvars=Yvars_array,
             candidate_metadata=candidate_metadata,
+            bounds=bounds,
+            task_features=task_features,
+            feature_names=self.parameters,
+            metric_names=self.outcomes,
+            fidelity_features=list(target_fidelities.keys()),
+            target_fidelities=target_fidelities,
         )
 
     def _model_update(
@@ -137,21 +153,33 @@ class ArrayModelBridge(ModelBridge):
         Xs: List[np.ndarray],
         Ys: List[np.ndarray],
         Yvars: List[np.ndarray],
-        candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
+        candidate_metadata: Optional[List[List[TCandidateMetadata]]],
+        bounds: List[Tuple[float, float]],
+        task_features: List[int],
+        feature_names: List[str],
+        metric_names: List[str],
+        fidelity_features: List[int],
+        target_fidelities: Optional[Dict[int, float]],
     ) -> None:
         self.model.update(
-            Xs=Xs, Ys=Ys, Yvars=Yvars, candidate_metadata=candidate_metadata
+            Xs=Xs,
+            Ys=Ys,
+            Yvars=Yvars,
+            candidate_metadata=candidate_metadata,
+            bounds=bounds,
+            task_features=task_features,
+            feature_names=self.parameters,
+            metric_names=self.outcomes,
+            fidelity_features=list(target_fidelities.keys())
+            if target_fidelities
+            else None,
         )
 
     def _predict(
         self, observation_features: List[ObservationFeatures]
     ) -> List[ObservationData]:
-        # Convert observations to array
-        f, cov = self._model_predict(
-            X=self._transform_observation_features(
-                observation_features=observation_features
-            )
-        )
+        X = observation_features_to_array(self.parameters, observation_features)
+        f, cov = self._model_predict(X=X)
         # Convert arrays to observations
         return array_to_observation_data(f=f, cov=cov, outcomes=self.outcomes)
 
@@ -159,6 +187,11 @@ class ArrayModelBridge(ModelBridge):
         self, X: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]:  # pragma: no cover
         return self.model.predict(X=X)
+
+    def _get_extra_model_gen_kwargs(
+        self, optimization_config: OptimizationConfig
+    ) -> Dict[str, Any]:
+        return {}
 
     def _gen(
         self,
@@ -186,9 +219,7 @@ class ArrayModelBridge(ModelBridge):
         bounds, _, target_fidelities = get_bounds_and_task(
             search_space=search_space, param_names=self.parameters
         )
-        target_fidelities = {
-            i: float(v) for i, v in target_fidelities.items()  # pyre-ignore [6]
-        }
+        target_fidelities = {i: float(v) for i, v in target_fidelities.items()}
 
         if optimization_config is None:
             raise ValueError(
@@ -204,6 +235,9 @@ class ArrayModelBridge(ModelBridge):
         outcome_constraints = extract_outcome_constraints(
             outcome_constraints=optimization_config.outcome_constraints,
             outcomes=self.outcomes,
+        )
+        extra_model_gen_kwargs = self._get_extra_model_gen_kwargs(
+            optimization_config=optimization_config
         )
         linear_constraints = extract_parameter_constraints(
             search_space.parameter_constraints, self.parameters
@@ -224,6 +258,7 @@ class ArrayModelBridge(ModelBridge):
             model_gen_options=model_gen_options,
             rounding_func=transform_callback(self.parameters, self.transforms),
             target_fidelities=target_fidelities,
+            **extra_model_gen_kwargs,
         )
         # Transform array to observations
         observation_features = parse_observation_features(
@@ -306,6 +341,7 @@ class ArrayModelBridge(ModelBridge):
 
     def _cross_validate(
         self,
+        search_space: SearchSpace,
         obs_feats: List[ObservationFeatures],
         obs_data: List[ObservationData],
         cv_test_points: List[ObservationFeatures],
@@ -319,12 +355,24 @@ class ArrayModelBridge(ModelBridge):
             outcomes=self.outcomes,
             parameters=self.parameters,
         )
+        bounds, task_features, target_fidelities = get_bounds_and_task(
+            search_space=search_space, param_names=self.parameters
+        )
+
         X_test = np.array(
             [[obsf.parameters[p] for p in self.parameters] for obsf in cv_test_points]
         )
         # Use the model to do the cross validation
         f_test, cov_test = self._model_cross_validate(
-            Xs_train=Xs_train, Ys_train=Ys_train, Yvars_train=Yvars_train, X_test=X_test
+            Xs_train=Xs_train,
+            Ys_train=Ys_train,
+            Yvars_train=Yvars_train,
+            X_test=X_test,
+            bounds=bounds,
+            task_features=task_features,
+            feature_names=self.parameters,
+            metric_names=self.outcomes,
+            fidelity_features=list(target_fidelities.keys()),
         )
         # Convert array back to ObservationData
         return array_to_observation_data(f=f_test, cov=cov_test, outcomes=self.outcomes)
@@ -335,19 +383,29 @@ class ArrayModelBridge(ModelBridge):
         Ys_train: List[np.ndarray],
         Yvars_train: List[np.ndarray],
         X_test: np.ndarray,
+        bounds: List[Tuple[float, float]],
+        task_features: List[int],
+        feature_names: List[str],
+        metric_names: List[str],
+        fidelity_features: List[int],
     ) -> Tuple[np.ndarray, np.ndarray]:  # pragma: no cover
         return self.model.cross_validate(
-            Xs_train=Xs_train, Ys_train=Ys_train, Yvars_train=Yvars_train, X_test=X_test
+            Xs_train=Xs_train,
+            Ys_train=Ys_train,
+            Yvars_train=Yvars_train,
+            X_test=X_test,
+            bounds=bounds,
+            task_features=task_features,
+            feature_names=feature_names,
+            metric_names=metric_names,
+            fidelity_features=fidelity_features,
         )
 
     def _evaluate_acquisition_function(
         self, observation_features: List[ObservationFeatures]
     ) -> List[float]:
-        return self._model_evaluate_acquisition_function(
-            X=self._transform_observation_features(
-                observation_features=observation_features
-            )
-        ).tolist()
+        X = observation_features_to_array(self.parameters, observation_features)
+        return self._model_evaluate_acquisition_function(X=X).tolist()
 
     def _model_evaluate_acquisition_function(self, X: np.ndarray) -> np.ndarray:
         raise NotImplementedError  # pragma: no cover
@@ -388,12 +446,26 @@ class ArrayModelBridge(ModelBridge):
         importances_arr = importances_dict[metric_name].flatten()
         return dict(zip(self.parameters, importances_arr))
 
+    def _transform_observation_data(
+        self, observation_data: List[ObservationData]
+    ) -> Any:  # TODO(jej): Make return type parametric
+        """Apply terminal transform to given observation data and return result.
+
+        Converts a set of observation data to a tuple of
+            - an (n x m) array of means
+            - an (n x m x m) array of covariances
+        """
+        try:
+            return observation_data_to_array(observation_data=observation_data)
+        except (KeyError, TypeError):  # pragma: no cover
+            raise ValueError("Invalid formatting of observation data.")
+
     def _transform_observation_features(
         self, observation_features: List[ObservationFeatures]
-    ) -> Any:
-        """Apply terminal transform to given observation features and return result.
+    ) -> Any:  # TODO(jej): Make return type parametric
+        """Apply terminal transform to given observation features and return result
+        as an N x D array of points.
         """
-        """Converts a set of observation features to a nxd array of points."""
         try:
             return np.array(
                 [
@@ -405,30 +477,6 @@ class ArrayModelBridge(ModelBridge):
             )
         except (KeyError, TypeError):  # pragma: no cover
             raise ValueError("Invalid formatting of observation features.")
-
-
-def array_to_observation_data(
-    f: np.ndarray, cov: np.ndarray, outcomes: List[str]
-) -> List[ObservationData]:
-    """Convert arrays of model predictions to a list of ObservationData.
-
-    Args:
-        f: An (n x d) array
-        cov: An (n x d x d) array
-        outcomes: A list of d outcome names
-
-    Returns: A list of n ObservationData
-    """
-    observation_data = []
-    for i in range(f.shape[0]):
-        observation_data.append(
-            ObservationData(
-                metric_names=list(outcomes),
-                means=f[i, :].copy(),
-                covariance=cov[i, :, :].copy(),
-            )
-        )
-    return observation_data
 
 
 def _convert_observations(
@@ -480,60 +528,6 @@ def _convert_observations(
     if not any_candidate_metadata_is_not_none:
         candidate_metadata = None  # pyre-ignore[9]: Change of variable type.
     return Xs_array, Ys_array, Yvars_array, candidate_metadata
-
-
-def extract_objective_weights(objective: Objective, outcomes: List[str]) -> np.ndarray:
-    """Extract a weights for objectives.
-
-    Weights are for a maximization problem.
-
-    Give an objective weight to each modeled outcome. Outcomes that are modeled
-    but not part of the objective get weight 0.
-
-    In the single metric case, the objective is given either +/- 1, depending
-    on the minimize flag.
-
-    In the multiple metric case, each objective is given the input weight,
-    multiplied by the minimize flag.
-
-    Args:
-        objective: Objective to extract weights from.
-        outcomes: n-length list of names of metrics.
-
-    Returns:
-        (n,) array of weights.
-
-    """
-    s = -1.0 if objective.minimize else 1.0
-    objective_weights = np.zeros(len(outcomes))
-    if isinstance(objective, ScalarizedObjective):
-        for obj_metric, obj_weight in objective.metric_weights:
-            objective_weights[outcomes.index(obj_metric.name)] = obj_weight * s
-    elif isinstance(objective, MultiObjective):
-        for obj_metric, obj_weight in objective.metric_weights:
-            # Rely on previously extracted lower_is_better weights not objective.
-            objective_weights[outcomes.index(obj_metric.name)] = obj_weight or s
-    else:
-        objective_weights[outcomes.index(objective.metric.name)] = s
-    return objective_weights
-
-
-def extract_outcome_constraints(
-    outcome_constraints: List[OutcomeConstraint], outcomes: List[str]
-) -> TBounds:
-    # Extract outcome constraints
-    if len(outcome_constraints) > 0:
-        A = np.zeros((len(outcome_constraints), len(outcomes)))
-        b = np.zeros((len(outcome_constraints), 1))
-        for i, c in enumerate(outcome_constraints):
-            s = 1 if c.op == ComparisonOp.LEQ else -1
-            j = outcomes.index(c.metric.name)
-            A[i, j] = s
-            b[i, 0] = s * c.bound
-        outcome_constraint_bounds: TBounds = (A, b)
-    else:
-        outcome_constraint_bounds = None
-    return outcome_constraint_bounds
 
 
 def validate_optimization_config(
