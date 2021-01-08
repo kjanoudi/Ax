@@ -162,6 +162,8 @@ class AxClient(WithDBSettingsBase):
         parameters: List[Dict[str, Union[TParamValue, List[TParamValue]]]],
         name: Optional[str] = None,
         objective_name: Optional[str] = None,
+        objectives: Optional[Dict[str, str]] = None,
+        objective_thresholds: Optional[List[str]] = None,
         minimize: bool = False,
         parameter_constraints: Optional[List[str]] = None,
         outcome_constraints: Optional[List[str]] = None,
@@ -251,6 +253,8 @@ class AxClient(WithDBSettingsBase):
         self._experiment = make_experiment(
             name=name,
             parameters=parameters,
+            objectives=objectives,
+            objective_thresholds=objective_thresholds,
             objective_name=objective_name,
             minimize=minimize,
             parameter_constraints=parameter_constraints,
