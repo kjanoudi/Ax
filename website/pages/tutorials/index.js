@@ -55,8 +55,8 @@ class TutorialHome extends React.Component {
                 <a href="raytune_pytorch_cnn.html">
                   Hyperparameter Optimization via Raytune
                 </a>
-                &nbsp; provides an example of hyperparameter optimization with
-                Ax + Raytune.
+                &nbsp; provides an example of parallelized hyperparameter optimization
+                using Ax + Raytune.
               </li>
             </ul>
             <ul>
@@ -64,6 +64,15 @@ class TutorialHome extends React.Component {
                 <a href="multi_task.html">Multi-Task Modeling</a>
                 &nbsp; illustrates multi-task Bayesian Optimization on a
                 constrained synthetic Hartmann6 problem.
+              </li>
+            </ul>
+            <ul>
+              <li>
+                <a href="multiobjective_optimization.html">
+                  Multi-Objective Optimization
+                </a>
+                &nbsp; demonstrates Multi-Objective Bayesian Optimization on a
+                synthetic Branin-Currin test function.
               </li>
             </ul>
             {/* <ul>

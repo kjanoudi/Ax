@@ -18,7 +18,6 @@ from botorch.utils import (
     get_outcome_constraint_transforms,
 )
 from botorch.utils.multi_objective.scalarization import get_chebyshev_scalarization
-from botorch.utils.transforms import squeeze_last_dim
 from torch import Tensor
 
 
@@ -59,17 +58,21 @@ def get_PosteriorMean(
     if kwargs.get("chebyshev_scalarization", False):
         obj_tf = get_chebyshev_scalarization(
             weights=objective_weights,
-            Y=squeeze_last_dim(torch.stack(kwargs.get("Ys")).transpose(0, 1)),
+            Y=torch.stack(kwargs.get("Ys")).transpose(0, 1).squeeze(-1),
         )
     else:
         obj_tf = get_objective_weights_transform(objective_weights)
+
+    def obj_fn(samples: Tensor, X: Optional[Tensor] = None) -> Tensor:
+        return obj_tf(samples)
+
     if outcome_constraints is None:
-        objective = GenericMCObjective(objective=obj_tf)
+        objective = GenericMCObjective(objective=obj_fn)
     else:
         con_tfs = get_outcome_constraint_transforms(outcome_constraints)
-        inf_cost = get_infeasible_cost(X=X_observed, model=model, objective=obj_tf)
+        inf_cost = get_infeasible_cost(X=X_observed, model=model, objective=obj_fn)
         objective = ConstrainedMCObjective(
-            objective=obj_tf, constraints=con_tfs or [], infeasible_cost=inf_cost
+            objective=obj_fn, constraints=con_tfs or [], infeasible_cost=inf_cost
         )
     # Use qSimpleRegret, not analytic posterior, to handle arbitrary objective fns.
     acq_func = qSimpleRegret(model, objective=objective)

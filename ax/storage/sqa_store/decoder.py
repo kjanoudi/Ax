@@ -22,7 +22,11 @@ from ax.core.optimization_config import (
     MultiObjectiveOptimizationConfig,
     OptimizationConfig,
 )
-from ax.core.outcome_constraint import ObjectiveThreshold, OutcomeConstraint
+from ax.core.outcome_constraint import (
+    ObjectiveThreshold,
+    OutcomeConstraint,
+    ScalarizedOutcomeConstraint,
+)
 from ax.core.parameter import ChoiceParameter, FixedParameter, Parameter, RangeParameter
 from ax.core.parameter_constraint import (
     OrderConstraint,
@@ -519,6 +523,45 @@ class Decoder:
                 op=metric_sqa.op,
                 relative=metric_sqa.relative,
             )
+        elif metric_sqa.intent == MetricIntent.SCALARIZED_OUTCOME_CONSTRAINT:
+            if (
+                metric_sqa.bound is None
+                or metric_sqa.op is None
+                or metric_sqa.relative is None
+            ):
+                raise SQADecodeError(  # pragma: no cover
+                    "Cannot decode SQAMetric to Scalarized OutcomeConstraint because "
+                    "bound, op, or relative is None."
+                )
+            metrics_sqa_children = (
+                metric_sqa.scalarized_outcome_constraint_children_metrics
+            )
+            if metrics_sqa_children is None:
+                raise SQADecodeError(  # pragma: no cover
+                    "Cannot decode SQAMetric to Scalarized OutcomeConstraint \
+                    because the parent metric has no children metrics."
+                )
+
+            # Extracting metric and weight for each child
+            metrics, weights = zip(
+                *[
+                    (
+                        self.metric_from_sqa_util(child),
+                        child.scalarized_outcome_constraint_weight,
+                    )
+                    for child in metrics_sqa_children
+                ]
+            )
+            return ScalarizedOutcomeConstraint(
+                metrics=list(metrics),
+                weights=list(weights),
+                # pyre-fixme[6]: Expected `float` for 2nd param but got
+                #  `Optional[float]`.
+                bound=metric_sqa.bound,
+                op=metric_sqa.op,
+                relative=metric_sqa.relative,
+            )
+
         elif metric_sqa.intent == MetricIntent.OBJECTIVE_THRESHOLD:
             if metric_sqa.bound is None or metric_sqa.relative is None:
                 raise SQADecodeError(  # pragma: no cover
@@ -824,6 +867,8 @@ class Decoder:
         trial._abandoned_reason = trial_sqa.abandoned_reason
         # pyre-fixme[9]: _run_metadata has type `Dict[str, Any]`; used as
         #  `Optional[Dict[str, Any]]`.
+        # pyre-fixme[8]: Attribute has type `Dict[str, typing.Any]`; used as
+        #  `Optional[typing.Dict[Variable[_KT], Variable[_VT]]]`.
         trial._run_metadata = (
             # pyre-fixme[6]: Expected `Mapping[Variable[_KT], Variable[_VT]]` for
             #  1st param but got `Optional[Dict[str, typing.Any]]`.

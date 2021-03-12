@@ -442,6 +442,7 @@ class Experiment(Base):
                 "this experiment, and none were passed in to `fetch_data`."
             )
         if not any(t.status.expecting_data for t in trials):
+            logger.info("No trials are in a state expecting data. Returning empty data")
             return Data()
         metrics_to_fetch = list(metrics or self.metrics.values())
         metrics_by_class = self._metrics_by_class(metrics=metrics_to_fetch)
@@ -601,6 +602,13 @@ class Experiment(Base):
             status: self.get_trials_by_indices(trial_indices=idcs)
             for status, idcs in self.trial_indices_by_status.items()
         }
+
+    @property
+    def trials_expecting_data(self) -> List[BaseTrial]:
+        """List[BaseTrial]: the list of all trials for which data has arrived
+        or is expected to arrive.
+        """
+        return [trial for trial in self.trials.values() if trial.status.expecting_data]
 
     @property
     def trial_indices_by_status(self) -> Dict[TrialStatus, Set[int]]:
@@ -820,11 +828,3 @@ class Experiment(Base):
         with multiple trial types, use the MultiTypeExperiment class.
         """
         return trial_type is None
-
-    @property
-    def trials_expecting_data(self) -> List[BaseTrial]:
-        """List[BaseTrial]: the list of all trials for which data has arrived
-        or is expected to arrive.
-
-        """
-        return [trial for trial in self.trials.values() if trial.status.expecting_data]

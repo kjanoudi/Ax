@@ -141,6 +141,8 @@ class REMBOStrategy(GenerationStrategy):
         """Generator changes every iteration with rotating strategy"""
         return list(range(self.current_iteration))
 
+    # pyre-fixme[14]: `gen` overrides method defined in `GenerationStrategy`
+    #  inconsistently.
     def gen(
         self,
         experiment: Experiment,
@@ -229,6 +231,9 @@ class REMBOStrategy(GenerationStrategy):
             return None
         # Else,
         df_i = data.df[data.df["arm_name"].isin(arm_names)].copy()
+        # pyre-fixme[6]: Expected `Optional[pandas.core.frame.DataFrame]` for 1st
+        #  param but got `Union[pandas.core.frame.DataFrame,
+        #  pandas.core.series.Series]`.
         return Data(df_i)
 
     def get_projection(

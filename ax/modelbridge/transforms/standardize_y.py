@@ -4,15 +4,16 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections import defaultdict
 from typing import TYPE_CHECKING, DefaultDict, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 from ax.core.observation import ObservationData, ObservationFeatures
 from ax.core.optimization_config import OptimizationConfig
+from ax.core.outcome_constraint import ScalarizedOutcomeConstraint
 from ax.core.search_space import SearchSpace
 from ax.core.types import TConfig, TParamValue
 from ax.modelbridge.transforms.base import Transform
+from ax.modelbridge.transforms.utils import get_data
 from ax.utils.common.logger import get_logger
 
 
@@ -41,15 +42,8 @@ class StandardizeY(Transform):
             raise ValueError(
                 "StandardizeY transform requires non-empty observation data."
             )
+        Ys = get_data(observation_data=observation_data)
         # Compute means and SDs
-        Ys: DefaultDict[str, List[float]] = defaultdict(list)
-        for obsd in observation_data:
-            for i, m in enumerate(obsd.metric_names):
-                Ys[m].append(obsd.means[i])
-        # Expected `DefaultDict[Union[str, typing.Tuple[str, Optional[Union[bool, float,
-        # str]]]], List[float]]` for 1st anonymous parameter to call
-        # `ax.modelbridge.transforms.standardize_y.compute_standardization_parameters`
-        # but got `DefaultDict[str, List[float]]`.
         # pyre-fixme[6]: Expected `DefaultDict[Union[str, Tuple[str, Optional[Union[b...
         self.Ymean, self.Ystd = compute_standardization_parameters(Ys)
 
@@ -77,9 +71,30 @@ class StandardizeY(Transform):
                 raise ValueError(
                     f"StandardizeY transform does not support relative constraint {c}"
                 )
-            c.bound = float(
-                (c.bound - self.Ymean[c.metric.name]) / self.Ystd[c.metric.name]
-            )
+            if isinstance(c, ScalarizedOutcomeConstraint):
+                # transform \sum (wi * yi) <= C to
+                # \sum (wi * si * zi) <= C - \sum (wi * mu_i) that zi = (yi - mu_i) / si
+
+                # update bound C to new c = C.bound - sum_i (wi * mu_i)
+                agg_mean = np.sum(
+                    [
+                        c.weights[i] * self.Ymean[metric.name]
+                        for i, metric in enumerate(c.metrics)
+                    ]
+                )
+                c.bound = float(c.bound - agg_mean)
+
+                # update the weights in the scalarized constraint
+                # new wi = wi * si
+                new_weight = [
+                    c.weights[i] * self.Ystd[metric.name]
+                    for i, metric in enumerate(c.metrics)
+                ]
+                c.weights = new_weight
+            else:
+                c.bound = float(
+                    (c.bound - self.Ymean[c.metric.name]) / self.Ystd[c.metric.name]
+                )
         return optimization_config
 
     def untransform_observation_data(

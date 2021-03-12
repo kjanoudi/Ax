@@ -31,7 +31,6 @@ from botorch.acquisition.utils import get_acquisition_function
 from botorch.models.model import Model
 from botorch.optim.optimize import optimize_acqf_list
 from botorch.utils.multi_objective.pareto import is_non_dominated
-from botorch.utils.transforms import squeeze_last_dim
 from torch import Tensor
 
 
@@ -133,7 +132,7 @@ def get_EHVI(
     )
     if "Ys" not in kwargs:
         raise ValueError("Expected Hypervolume Improvement requires Ys argument")
-    Y_tensor = squeeze_last_dim(torch.stack(kwargs.get("Ys")).transpose(0, 1))
+    Y_tensor = torch.stack(kwargs.get("Ys")).transpose(0, 1).squeeze(-1)
     # For EHVI acquisition functions we pass the constraint transform directly.
     if outcome_constraints is None:
         cons_tfs = None
@@ -239,7 +238,7 @@ def pareto_frontier_evaluator(
             dominate the objective_thresholds contribute nothing to hypervolume.
         X: A `n x d` tensor of features to evaluate.
         Y: A `n x m` tensor of outcomes to use instead of predictions.
-        Yvar: A `n x m` tensor of input variances (NaN if unobserved).
+        Yvar: A `n x m x m` tensor of input covariances (NaN if unobserved).
         outcome_constraints: A tuple of (A, b). For k outcome constraints
             and m outputs at f(x), A is (k x m) and b is (k x 1) such that
             A f(x) <= b.
@@ -291,6 +290,10 @@ def pareto_frontier_evaluator(
         Yvar = Yvar[feas]
         Y_obj = Y_obj[feas]
 
+    if Y.shape[0] == 0:
+        # if there are no feasible points that are better than the reference point
+        # return empty tensors
+        return Y, Yvar
     # calculate pareto front with only objective outcomes:
     frontier_mask = is_non_dominated(Y_obj)
 

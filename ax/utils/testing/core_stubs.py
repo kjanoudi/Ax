@@ -24,7 +24,11 @@ from ax.core.optimization_config import (
     MultiObjectiveOptimizationConfig,
     OptimizationConfig,
 )
-from ax.core.outcome_constraint import ObjectiveThreshold, OutcomeConstraint
+from ax.core.outcome_constraint import (
+    ObjectiveThreshold,
+    OutcomeConstraint,
+    ScalarizedOutcomeConstraint,
+)
 from ax.core.parameter import (
     ChoiceParameter,
     FixedParameter,
@@ -151,6 +155,34 @@ def get_multi_type_experiment(
     )
 
     if add_trials and add_trial_type:
+        generator = get_sobol(experiment.search_space)
+        gr = generator.gen(10)
+        t1 = experiment.new_batch_trial(generator_run=gr, trial_type="type1")
+        t2 = experiment.new_batch_trial(generator_run=gr, trial_type="type2")
+        t1.set_status_quo_with_weight(status_quo=t1.arms[0], weight=0.5)
+        t2.set_status_quo_with_weight(status_quo=t2.arms[0], weight=0.5)
+        t1.run()
+        t2.run()
+
+    return experiment
+
+
+def get_multi_type_experiment_with_multi_objective(
+    add_trials: bool = False,
+) -> MultiTypeExperiment:
+    oc = get_branin_multi_objective_optimization_config()
+    experiment = MultiTypeExperiment(
+        name="test_exp",
+        search_space=get_branin_search_space(),
+        default_trial_type="type1",
+        default_runner=SyntheticRunner(dummy_metadata="dummy1"),
+        optimization_config=oc,
+    )
+    experiment.add_trial_type(
+        trial_type="type2", runner=SyntheticRunner(dummy_metadata="dummy2")
+    )
+
+    if add_trials:
         generator = get_sobol(experiment.search_space)
         gr = generator.gen(10)
         t1 = experiment.new_batch_trial(generator_run=gr, trial_type="type1")
@@ -312,6 +344,26 @@ def get_experiment_with_scalarized_objective() -> Experiment:
         optimization_config=optimization_config,
         status_quo=get_status_quo(),
         description="test experiment with scalarized objective",
+        tracking_metrics=[Metric(name="tracking")],
+        is_test=True,
+    )
+
+
+def get_experiment_with_scalarized_outcome_constraint() -> Experiment:
+    objective = get_objective()
+    outcome_constraints = [
+        get_outcome_constraint(),
+        get_scalarized_outcome_constraint(),
+    ]
+    optimization_config = OptimizationConfig(
+        objective=objective, outcome_constraints=outcome_constraints
+    )
+    return Experiment(
+        name="test_experiment_scalarized_constraint",
+        search_space=get_search_space(),
+        optimization_config=optimization_config,
+        status_quo=get_status_quo(),
+        description="test experiment with scalarized constraint",
         tracking_metrics=[Metric(name="tracking")],
         is_test=True,
     )
@@ -654,6 +706,15 @@ def get_objective_threshold() -> ObjectiveThreshold:
 
 def get_outcome_constraint() -> OutcomeConstraint:
     return OutcomeConstraint(metric=Metric(name="m2"), op=ComparisonOp.GEQ, bound=-0.25)
+
+
+def get_scalarized_outcome_constraint() -> ScalarizedOutcomeConstraint:
+    return ScalarizedOutcomeConstraint(
+        metrics=[Metric(name="oc_m3"), Metric(name="oc_m4")],
+        weights=[0.2, 0.8],
+        op=ComparisonOp.GEQ,
+        bound=-0.25,
+    )
 
 
 def get_branin_outcome_constraint() -> OutcomeConstraint:

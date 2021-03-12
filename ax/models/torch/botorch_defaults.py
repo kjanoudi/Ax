@@ -188,11 +188,33 @@ def get_NEI(
     X_pending: Optional[Tensor] = None,
     **kwargs: Any,
 ) -> AcquisitionFunction:
-    r"""Instantiates a qNoisyExpectedImprovement acquisition function.
+    r"""Instantiates a qNoisyExpectedImprovement acquisition function."""
+    return _get_acqusition_func(
+        model=model,
+        acquisition_function_name="qNEI",
+        objective_weights=objective_weights,
+        outcome_constraints=outcome_constraints,
+        X_observed=X_observed,
+        X_pending=X_pending,
+        **kwargs,
+    )
+
+
+def _get_acqusition_func(
+    model: Model,
+    acquisition_function_name: str,
+    objective_weights: Tensor,
+    outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
+    X_observed: Optional[Tensor] = None,
+    X_pending: Optional[Tensor] = None,
+    **kwargs: Any,
+) -> AcquisitionFunction:
+    r"""Instantiates a acquisition function.
 
     Args:
         model: The underlying model which the acqusition function uses
             to estimate acquisition values of candidates.
+        acquisition_function_name: Name of the acquisition function.
         objective_weights: The objective is to maximize a weighted sum of
             the columns of f(x). These are the weights.
         outcome_constraints: A tuple of (A, b). For k outcome constraints
@@ -211,7 +233,7 @@ def get_NEI(
         chebyshev_scalarization: Use augmented Chebyshev scalarization.
 
     Returns:
-        qNoisyExpectedImprovement: The instantiated acquisition function.
+        The instantiated acquisition function.
     """
     if X_observed is None:
         raise ValueError("There are no feasible observed points.")
@@ -223,16 +245,20 @@ def get_NEI(
         obj_tf = get_chebyshev_scalarization(weights=objective_weights, Y=Y_tensor)
     else:
         obj_tf = get_objective_weights_transform(objective_weights)
+
+    def objective(samples: Tensor, X: Optional[Tensor] = None) -> Tensor:
+        return obj_tf(samples)
+
     if outcome_constraints is None:
-        objective = GenericMCObjective(objective=obj_tf)
+        objective = GenericMCObjective(objective=objective)
     else:
         con_tfs = get_outcome_constraint_transforms(outcome_constraints)
-        inf_cost = get_infeasible_cost(X=X_observed, model=model, objective=obj_tf)
+        inf_cost = get_infeasible_cost(X=X_observed, model=model, objective=objective)
         objective = ConstrainedMCObjective(
-            objective=obj_tf, constraints=con_tfs or [], infeasible_cost=inf_cost
+            objective=objective, constraints=con_tfs or [], infeasible_cost=inf_cost
         )
     return get_acquisition_function(
-        acquisition_function_name="qNEI",
+        acquisition_function_name=acquisition_function_name,
         model=model,
         objective=objective,
         X_observed=X_observed,
@@ -243,6 +269,7 @@ def get_NEI(
         # pyre-fixme[6]: Expected `Optional[int]` for 9th param but got
         #  `Union[float, int]`.
         seed=torch.randint(1, 10000, (1,)).item(),
+        marginalize_dim=kwargs.get("marginalize_dim"),
     )
 
 
@@ -251,6 +278,7 @@ def scipy_optimizer(
     bounds: Tensor,
     n: int,
     inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
+    equality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
     fixed_features: Optional[Dict[int, float]] = None,
     rounding_func: Optional[Callable[[Tensor], Tensor]] = None,
     **kwargs: Any,
@@ -265,6 +293,9 @@ def scipy_optimizer(
         inequality constraints: A list of tuples (indices, coefficients, rhs),
             with each tuple encoding an inequality constraint of the form
             `\sum_i (X[indices[i]] * coefficients[i]) >= rhs`
+        equality constraints: A list of tuples (indices, coefficients, rhs),
+            with each tuple encoding an equality constraint of the form
+            `\sum_i (X[indices[i]] * coefficients[i]) == rhs`
         fixed_features: A map {feature_index: value} for features that should
             be fixed to a particular value during generation.
         rounding_func: A function that rounds an optimization result
@@ -298,6 +329,7 @@ def scipy_optimizer(
         raw_samples=raw_samples,
         options=kwargs,
         inequality_constraints=inequality_constraints,
+        equality_constraints=equality_constraints,
         fixed_features=fixed_features,
         sequential=sequential,
         post_processing_func=rounding_func,
@@ -499,6 +531,7 @@ def _get_model(
         warp_tf = get_warping_transform(
             d=X.shape[-1],
             task_feature=task_feature,
+            batch_shape=X.shape[:-2],  # pyre-ignore [6]
         )
     else:
         warp_tf = None
@@ -572,13 +605,15 @@ def _get_model(
 
 def get_warping_transform(
     d: int,
+    batch_shape: Optional[torch.Size] = None,
     task_feature: Optional[int] = None,
 ) -> Warp:
     """Construct input warping transform.
 
     Args:
         d: The dimension of the input, including task features
-        task_feature: the index of the task feature
+        batch_shape: The batch_shape of the model
+        task_feature: The index of the task feature
 
     Returns:
         The input warping transform.
@@ -593,5 +628,6 @@ def get_warping_transform(
         # prior with a median of 1
         concentration1_prior=LogNormalPrior(0.0, 0.75 ** 0.5),
         concentration0_prior=LogNormalPrior(0.0, 0.75 ** 0.5),
+        batch_shape=batch_shape,
     )
     return tf

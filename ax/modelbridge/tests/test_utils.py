@@ -8,13 +8,18 @@ from unittest.mock import patch
 
 import numpy as np
 from ax.core.arm import Arm
+from ax.core.base_trial import TrialStatus
 from ax.core.data import Data
 from ax.core.generator_run import GeneratorRun
+from ax.core.metric import Metric
 from ax.core.observation import ObservationFeatures
+from ax.core.outcome_constraint import OutcomeConstraint, ScalarizedOutcomeConstraint
+from ax.core.types import ComparisonOp
 from ax.modelbridge.modelbridge_utils import (
     clamp_observation_features,
     get_pending_observation_features,
     pending_observations_as_array,
+    extract_outcome_constraints,
 )
 from ax.utils.common.testutils import TestCase
 from ax.utils.testing.core_stubs import get_experiment
@@ -65,6 +70,32 @@ class TestModelbridgeUtils(TestCase):
             ),
             {"tracking": [self.obs_feat], "m2": [self.obs_feat], "m1": [self.obs_feat]},
         )
+        # When a trial is abandoned, it should appear in pending features whether
+        # or not there is data for it.
+        self.trial._status = TrialStatus.ABANDONED  # Cannot re-mark a failed trial.
+        self.assertEqual(
+            get_pending_observation_features(
+                self.experiment, include_failed_as_pending=True
+            ),
+            {"tracking": [self.obs_feat], "m2": [self.obs_feat], "m1": [self.obs_feat]},
+        )
+        # Checking with data for all metrics.
+        with patch.object(
+            self.trial,
+            "fetch_data",
+            return_value=Data.from_evaluations(
+                {self.trial.arm.name: {"m1": (1, 0), "m2": (1, 0), "tracking": (1, 0)}},
+                trial_index=self.trial.index,
+            ),
+        ):
+            self.assertEqual(
+                get_pending_observation_features(self.experiment),
+                {
+                    "tracking": [self.obs_feat],
+                    "m2": [self.obs_feat],
+                    "m1": [self.obs_feat],
+                },
+            )
 
     def test_get_pending_observation_features_batch_trial(self):
         # Check the same functionality for batched trials.
@@ -81,6 +112,41 @@ class TestModelbridgeUtils(TestCase):
                 "m2": [self.obs_feat, sq_obs_feat],
                 "m1": [self.obs_feat, sq_obs_feat],
             },
+        )
+
+    def test_get_pending_observation_features_based_on_trial_status(self):
+        # Pending observations should be none if there aren't any as trial is
+        # candidate.
+        self.assertTrue(self.trial.status.is_candidate)
+        self.assertIsNone(get_pending_observation_features(self.experiment))
+        self.trial.mark_staged()
+        # Now that the trial is staged, it should become a pending trial on the
+        # experiment and appear as pending for all metrics.
+        self.assertEqual(
+            get_pending_observation_features(self.experiment),
+            {"tracking": [self.obs_feat], "m2": [self.obs_feat], "m1": [self.obs_feat]},
+        )
+        # Same should be true for running trial.
+        # NOTE: Can't mark a staged trial running unless it uses a runner that
+        # specifically requires staging; hacking around that here since the marking
+        # logic does not matter for this test.
+        self.trial._status = TrialStatus.RUNNING
+        # Now that the trial is staged, it should become a pending trial on the
+        # experiment and appear as pending for all metrics.
+        self.assertEqual(
+            get_pending_observation_features(self.experiment),
+            {"tracking": [self.obs_feat], "m2": [self.obs_feat], "m1": [self.obs_feat]},
+        )
+        # When a trial is marked failed, it should no longer appear in pending.
+        self.trial.mark_failed()
+        self.assertIsNone(get_pending_observation_features(self.experiment))
+        # And if the trial is abandoned, it should always appear in pending features.
+        self.trial._status = TrialStatus.ABANDONED  # Cannot re-mark a failed trial.
+        self.assertEqual(
+            get_pending_observation_features(
+                self.experiment, include_failed_as_pending=True
+            ),
+            {"tracking": [self.obs_feat], "m2": [self.obs_feat], "m1": [self.obs_feat]},
         )
 
     def test_pending_observations_as_array(self):
@@ -176,3 +242,32 @@ class TestModelbridgeUtils(TestCase):
         for obs_ft, expected_obs_ft in cases:
             actual_obs_ft = clamp_observation_features([obs_ft], search_space)
             self.assertEqual(actual_obs_ft[0], expected_obs_ft)
+
+    def test_extract_outcome_constraints(self):
+        outcomes = ["m1", "m2", "m3"]
+        # pass no outcome constraints
+        self.assertIsNone(extract_outcome_constraints([], outcomes))
+
+        outcome_constraints = [
+            OutcomeConstraint(metric=Metric("m1"), op=ComparisonOp.LEQ, bound=0)
+        ]
+        res = extract_outcome_constraints(outcome_constraints, outcomes)
+        self.assertEqual(res[0].shape, (1, 3))
+        self.assertListEqual(list(res[0][0]), [1, 0, 0])
+        self.assertEqual(res[1][0][0], 0)
+
+        outcome_constraints = [
+            OutcomeConstraint(metric=Metric("m1"), op=ComparisonOp.LEQ, bound=0),
+            ScalarizedOutcomeConstraint(
+                metrics=[Metric("m2"), Metric("m3")],
+                weights=[0.5, 0.5],
+                op=ComparisonOp.GEQ,
+                bound=1,
+            ),
+        ]
+        res = extract_outcome_constraints(outcome_constraints, outcomes)
+        self.assertEqual(res[0].shape, (2, 3))
+        self.assertListEqual(list(res[0][0]), [1, 0, 0])
+        self.assertListEqual(list(res[0][1]), [0, -0.5, -0.5])
+        self.assertEqual(res[1][0][0], 0)
+        self.assertEqual(res[1][1][0], -1)
