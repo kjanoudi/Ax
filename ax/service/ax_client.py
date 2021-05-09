@@ -4,6 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from ax.core.objective import MultiObjective
 import json
 import logging
 import warnings
@@ -1091,12 +1092,15 @@ class AxClient(WithDBSettingsBase):
             raise ValueError(
                 f"Arms {not_trial_arm_names} are not part of trial #{trial.index}."
             )
-        evaluations = {
-            arm_name: raw_data_to_evaluation(
-                raw_data=raw_data[arm_name], objective_name=self.objective_name
-            )
-            for arm_name in raw_data
-        }
+        if type(self.objective) == MultiObjective:
+            evaluations = raw_data
+        else:
+            evaluations = {
+                arm_name: raw_data_to_evaluation(
+                    raw_data=raw_data[arm_name], objective_name=self.objective_name
+                )
+                for arm_name in raw_data
+            }
         data = data_from_evaluations(
             evaluations=evaluations,
             trial_index=trial.index,
