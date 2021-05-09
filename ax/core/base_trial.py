@@ -11,13 +11,13 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
+from ax.core.abstract_data import AbstractDataFrameData
 from ax.core.arm import Arm
-from ax.core.data import Data
 from ax.core.generator_run import GeneratorRun
 from ax.core.metric import Metric
 from ax.core.runner import Runner
 from ax.core.types import TCandidateMetadata
-from ax.utils.common.base import Base
+from ax.utils.common.base import SortableBase
 from ax.utils.common.typeutils import not_none
 
 
@@ -43,6 +43,10 @@ class TrialStatus(int, Enum):
     Additionally, when trials are deployed, they may be in an intermediate
     staged state (e.g. scheduled but waiting for resources) or immediately
     transition to running.
+
+    NOTE: Data for abandoned trials (or abandoned arms in batch trials) is
+    not passed to the model as part of training data, unless ``fit_abandoned``
+    option is specified to model bridge.
     """
 
     CANDIDATE = 0
@@ -129,7 +133,7 @@ def immutable_once_run(func: Callable) -> Callable:
     return _immutable_once_run
 
 
-class BaseTrial(ABC, Base):
+class BaseTrial(ABC, SortableBase):
     """Base class for representing trials.
 
     Trials are containers for arms that are deployed together. There are
@@ -306,7 +310,9 @@ class BaseTrial(ABC, Base):
 
     def assign_runner(self) -> BaseTrial:
         """Assigns default experiment runner if trial doesn't already have one."""
-        self._runner = self._runner or self.experiment.runner_for_trial(self)
+        runner = self._runner or self.experiment.runner_for_trial(self)
+        if runner is not None:
+            self._runner = runner.clone()
         return self
 
     def update_run_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -357,7 +363,9 @@ class BaseTrial(ABC, Base):
         self.mark_completed()
         return self
 
-    def fetch_data(self, metrics: Optional[List[Metric]] = None, **kwargs: Any) -> Data:
+    def fetch_data(
+        self, metrics: Optional[List[Metric]] = None, **kwargs: Any
+    ) -> AbstractDataFrameData:
         """Fetch data for this trial for all metrics on experiment.
 
         Args:
@@ -524,6 +532,12 @@ class BaseTrial(ABC, Base):
     def mark_abandoned(self, reason: Optional[str] = None) -> BaseTrial:
         """Mark trial as abandoned.
 
+        NOTE: Arms in abandoned trials are considered to be 'pending points'
+        in experiment after their abandonment to avoid Ax models suggesting
+        the same arm again as a new candidate. Arms in abandoned trials are
+        also excluded from model training data unless ``fit_abandoned`` option
+        is specified to model bridge.
+
         Args:
             abandoned_reason: The reason the trial was abandoned.
 
@@ -577,6 +591,14 @@ class BaseTrial(ABC, Base):
             raise ValueError(f"Cannot mark trial as {status}.")
         return self
 
+    def mark_arm_abandoned(
+        self, arm_name: str, reason: Optional[str] = None
+    ) -> BaseTrial:
+        raise NotImplementedError(
+            "Abandoning arms is only supported for `BatchTrial`. "
+            "Use `trial.mark_abandoned` if applicable."
+        )
+
     def _mark_failed_if_past_TTL(self) -> None:
         """If trial has TTL set and is running, check if the TTL has elapsed
         and mark the trial failed if so.
@@ -608,3 +630,7 @@ class BaseTrial(ABC, Base):
             self._experiment._trial_indices_by_status[self._status].remove(self.index)
         self._experiment._trial_indices_by_status[trial_status].add(self.index)
         self.__status = trial_status
+
+    @property
+    def _unique_id(self) -> str:
+        return str(self.index)

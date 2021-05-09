@@ -5,13 +5,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import numbers
+import warnings
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import plotly.graph_objs as go
+from ax.core.data import Data
+from ax.core.experiment import Experiment
 from ax.core.observation import Observation, ObservationFeatures
 from ax.modelbridge.base import ModelBridge
+from ax.modelbridge.registry import Models
 from ax.plot.base import (
     CI_OPACITY,
     DECIMALS,
@@ -33,9 +37,9 @@ from ax.plot.helper import (
     infer_is_relative,
     resize_subtitles,
 )
+from ax.utils.common.typeutils import checked_cast_optional
 from ax.utils.stats.statstools import relativize
 from plotly import subplots
-
 
 # type aliases
 Traces = List[Dict[str, Any]]
@@ -267,7 +271,6 @@ def _multiple_metric_traces(
         rel_y: if True, use relative effects on metric_y.
         fixed_features: Fixed features to use when making model predictions.
         data_selector: Function for selecting observations for plotting.
-
     """
     plot_data, _, _ = get_plot_data(
         model,
@@ -334,9 +337,11 @@ def plot_multiple_metrics(
     metric_x: str,
     metric_y: str,
     generator_runs_dict: TNullableGeneratorRunsDict = None,
-    rel: bool = True,
+    rel_x: bool = True,
+    rel_y: bool = True,
     fixed_features: Optional[ObservationFeatures] = None,
     data_selector: Optional[Callable[[Observation], bool]] = None,
+    **kwargs: Any,
 ) -> AxPlotConfig:
     """Plot raw values or predictions of two metrics for arms.
 
@@ -349,22 +354,26 @@ def plot_multiple_metrics(
         metric_y: metric to plot on the y-axis.
         generator_runs_dict: a mapping from
             generator run name to generator run.
-        rel: if True, use relative effects. Default is True.
+        rel_x: if True, use relative effects on metric_x.
+        rel_y: if True, use relative effects on metric_y.
         data_selector: Function for selecting observations for plotting.
-
     """
+    rel = checked_cast_optional(bool, kwargs.get("rel"))
+    if rel is not None:
+        warnings.warn("Use `rel_x` and `rel_y` instead of `rel`.", DeprecationWarning)
+        rel_x = rel
+        rel_y = rel
     traces = _multiple_metric_traces(
         model,
         metric_x,
         metric_y,
         generator_runs_dict,
-        rel_x=rel,
-        rel_y=rel,
+        rel_x=rel_x,
+        rel_y=rel_y,
         fixed_features=fixed_features,
         data_selector=data_selector,
     )
     num_cand_traces = len(generator_runs_dict) if generator_runs_dict is not None else 0
-
     layout = go.Layout(
         title="Objective Tradeoffs",
         hovermode="closest",
@@ -458,7 +467,6 @@ def plot_multiple_metrics(
         height=600,
         font={"size": 10},
     )
-
     fig = go.Figure(data=traces, layout=layout)
     return AxPlotConfig(data=fig, plot_type=AxPlotTypes.GENERIC)
 
@@ -496,7 +504,6 @@ def plot_objective_vs_constraints(
             Metrics that are not constraints will be relativized.
         fixed_features: Fixed features to use when making model predictions.
         data_selector: Function for selecting observations for plotting.
-
     """
     if subset_metrics is not None:
         metrics = subset_metrics
@@ -693,7 +700,6 @@ def lattice_multiple_metrics(
         show_arm_details_on_hover: if True, display
             parameterizations of arms on hover. Default is False.
         data_selector: Function for selecting observations for plotting.
-
     """
     metrics = model.metric_names
     fig = subplots.make_subplots(
@@ -988,7 +994,6 @@ def _single_metric_traces(
         arm_noun: noun to use instead of "arm" (e.g. group)
         fixed_features: Fixed features to use when making model predictions.
         data_selector: Function for selecting observations for plotting.
-
     """
     plot_data, _, _ = get_plot_data(
         model,
@@ -1073,7 +1078,6 @@ def plot_fitted(
             show in the ordering dropdown. Default is 'Custom'.
         show_CI: if True, render confidence intervals.
         data_selector: Function for selecting observations for plotting.
-
     """
     traces = _single_metric_traces(
         model,
@@ -1202,7 +1206,6 @@ def tile_fitted(
         metrics: List of metric names to restrict to when plotting.
         fixed_features: Fixed features to use when making model predictions.
         data_selector: Function for selecting observations for plotting.
-
     """
     metrics = metrics or list(model.metric_names)
     nrows = int(np.ceil(len(metrics) / 2))
@@ -1465,4 +1468,46 @@ def interact_fitted(
 
     return AxPlotConfig(
         data=go.Figure(data=traces, layout=layout), plot_type=AxPlotTypes.GENERIC
+    )
+
+
+def tile_observations(
+    experiment: Experiment,
+    data: Optional[Data] = None,
+    rel: bool = True,
+    metrics: Optional[List[str]] = None,
+    arm_names: Optional[List[str]] = None,
+) -> AxPlotConfig:
+    """
+    Tiled plot with all observed outcomes.
+
+    Will plot all observed arms. If data is provided will use that, otherwise
+    will fetch data from experiment. Will plot all metrics in data unless a
+    list is provided in metrics. If arm_names is provided will limit the plot
+    to only arms in that list.
+
+    Args:
+        experiment: Experiment
+        data: Data to use, otherwise will fetch data from experiment.
+        rel: Plot relative values, if experiment has status quo.
+        metrics: Limit results to this set of metrics.
+        arm_names: Limit results to this set of arms.
+
+    Returns: Plot config for the plot.
+    """
+    if data is None:
+        data = experiment.fetch_data()
+    if not isinstance(data, Data):
+        raise TypeError("data must be Data type")
+    if arm_names is not None:
+        data = Data(data.df[data.df["arm_name"].isin(arm_names)])
+    m_ts = Models.THOMPSON(
+        data=data,
+        search_space=experiment.search_space,
+        experiment=experiment,
+    )
+    return tile_fitted(
+        model=m_ts,
+        rel=rel and (experiment.status_quo is not None),
+        metrics=metrics,
     )

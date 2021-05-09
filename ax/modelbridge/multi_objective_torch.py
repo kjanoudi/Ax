@@ -116,14 +116,11 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
         if isinstance(optimization_config, MultiObjectiveOptimizationConfig):
             objective_thresholds = extract_objective_thresholds(
                 objective_thresholds=optimization_config.objective_thresholds,
+                objective=optimization_config.objective,
                 outcomes=self.outcomes,
             )
         else:
-            objective_thresholds = np.array([])
-        # pyre-fixme[35]: Target cannot be annotated.
-        objective_thresholds: Optional[np.ndarray] = (
-            objective_thresholds if len(objective_thresholds) else None
-        )
+            objective_thresholds = None
         if objective_thresholds is not None:
             extra_kwargs_dict["objective_thresholds"] = objective_thresholds
         return extra_kwargs_dict
@@ -144,17 +141,13 @@ class MultiObjectiveTorchModelBridge(TorchModelBridge):
     ) -> Tuple[np.ndarray, np.ndarray, TGenMetadata, List[TCandidateMetadata]]:
         if not self.model:  # pragma: no cover
             raise ValueError(FIT_MODEL_ERROR.format(action="_model_gen"))
-        obj_w, oc_c, l_c, pend_obs = validate_and_apply_final_transform(
+        (obj_w, oc_c, l_c, pend_obs, obj_t,) = validate_and_apply_final_transform(
             objective_weights=objective_weights,
             outcome_constraints=outcome_constraints,
             linear_constraints=linear_constraints,
             pending_observations=pending_observations,
+            objective_thresholds=objective_thresholds,
             final_transform=self._array_to_tensor,
-        )
-        obj_t = (
-            self._array_to_tensor(objective_thresholds)
-            if objective_thresholds is not None
-            else None
         )
         tensor_rounding_func = self._array_callable_to_tensor_callable(rounding_func)
         augmented_model_gen_options = {

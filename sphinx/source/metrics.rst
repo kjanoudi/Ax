@@ -16,6 +16,22 @@ Branin
     :undoc-members:
     :show-inheritance:
 
+Branin Map
+~~~~~~~~~~~
+
+.. automodule:: ax.metrics.branin_map
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+Chemistry
+~~~~~~~~~~~~~~~
+
+.. automodule:: ax.metrics.chemistry
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 Factorial
 ~~~~~~~~~
 
@@ -44,6 +60,22 @@ Noisy Functions
 ~~~~~~~~~~~~~~~
 
 .. automodule:: ax.metrics.noisy_function
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+Noisy Function Map
+~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.metrics.noisy_function_map
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+Sklearn
+~~~~~~~~~~~~~~~
+
+.. automodule:: ax.metrics.sklearn
     :members:
     :undoc-members:
     :show-inheritance:

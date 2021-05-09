@@ -11,8 +11,10 @@ import numpy as np
 import pandas as pd
 from ax.core.arm import Arm
 from ax.core.base_trial import TrialStatus
+from ax.core.batch_trial import BatchTrial
 from ax.core.data import Data
 from ax.core.generator_run import GeneratorRun
+from ax.core.map_data import MapData
 from ax.core.observation import (
     Observation,
     ObservationData,
@@ -308,6 +310,172 @@ class ObservationsTest(TestCase):
             self.assertTrue(np.array_equal(obs.data.means, t["mean_t"]))
             self.assertTrue(np.array_equal(obs.data.covariance, t["covariance_t"]))
             self.assertEqual(obs.arm_name, t["arm_name"])
+
+    def testObservationsFromMapData(self):
+        truth = {
+            0.5: {
+                "arm_name": "0_0",
+                "parameters": {"x": 0, "y": "a", "z": 1},
+                "mean": 2.0,
+                "sem": 2.0,
+                "trial_index": 1,
+                "metric_name": "a",
+                "updated_parameters": {"x": 0, "y": "a", "z": 0.5},
+                "mean_t": np.array([2.0]),
+                "covariance_t": np.array([[4.0]]),
+                "z": 0.5,
+                "timestamp": 50,
+            },
+            0.25: {
+                "arm_name": "0_1",
+                "parameters": {"x": 1, "y": "b", "z": 0.5},
+                "mean": 3.0,
+                "sem": 3.0,
+                "trial_index": 2,
+                "metric_name": "a",
+                "updated_parameters": {"x": 1, "y": "b", "z": 0.25},
+                "mean_t": np.array([3.0]),
+                "covariance_t": np.array([[9.0]]),
+                "z": 0.25,
+                "timestamp": 25,
+            },
+            1: {
+                "arm_name": "0_0",
+                "parameters": {"x": 0, "y": "a", "z": 1},
+                "mean": 4.0,
+                "sem": 4.0,
+                "trial_index": 1,
+                "metric_name": "b",
+                "updated_parameters": {"x": 0, "y": "a", "z": 1},
+                "mean_t": np.array([4.0]),
+                "covariance_t": np.array([[16.0]]),
+                "z": 1,
+                "timestamp": 100,
+            },
+        }
+        arms = {
+            obs["arm_name"]: Arm(name=obs["arm_name"], parameters=obs["parameters"])
+            for _, obs in truth.items()
+        }
+        experiment = Mock()
+        experiment._trial_indices_by_status = {status: set() for status in TrialStatus}
+        trials = {
+            obs["trial_index"]: Trial(
+                experiment, GeneratorRun(arms=[arms[obs["arm_name"]]])
+            )
+            for _, obs in truth.items()
+        }
+        type(experiment).arms_by_name = PropertyMock(return_value=arms)
+        type(experiment).trials = PropertyMock(return_value=trials)
+
+        df = pd.DataFrame(list(truth.values()))[
+            ["arm_name", "trial_index", "mean", "sem", "metric_name", "z", "timestamp"]
+        ]
+        data = MapData(df=df, map_keys=["z", "timestamp"])
+        observations = observations_from_data(experiment, data)
+
+        self.assertEqual(len(observations), 3)
+        for obs in observations:
+            t = truth[obs.features.parameters["z"]]
+            self.assertEqual(obs.features.parameters, t["updated_parameters"])
+            self.assertEqual(obs.features.trial_index, t["trial_index"])
+            self.assertEqual(obs.data.metric_names, [t["metric_name"]])
+            self.assertTrue(np.array_equal(obs.data.means, t["mean_t"]))
+            self.assertTrue(np.array_equal(obs.data.covariance, t["covariance_t"]))
+            self.assertEqual(obs.arm_name, t["arm_name"])
+            self.assertEqual(obs.features.metadata, {"timestamp": t["timestamp"]})
+
+    def testObservationsFromDataAbandoned(self):
+        truth = {
+            0.5: {
+                "arm_name": "0_0",
+                "parameters": {"x": 0, "y": "a", "z": 1},
+                "mean": 2.0,
+                "sem": 2.0,
+                "trial_index": 0,
+                "metric_name": "a",
+                "updated_parameters": {"x": 0, "y": "a", "z": 0.5},
+                "mean_t": np.array([2.0]),
+                "covariance_t": np.array([[4.0]]),
+                "z": 0.5,
+                "timestamp": 50,
+            },
+            1: {
+                "arm_name": "1_0",
+                "parameters": {"x": 0, "y": "a", "z": 1},
+                "mean": 4.0,
+                "sem": 4.0,
+                "trial_index": 1,
+                "metric_name": "b",
+                "updated_parameters": {"x": 0, "y": "a", "z": 1},
+                "mean_t": np.array([4.0]),
+                "covariance_t": np.array([[16.0]]),
+                "z": 1,
+                "timestamp": 100,
+            },
+            0.25: {
+                "arm_name": "2_0",
+                "parameters": {"x": 1, "y": "a", "z": 0.5},
+                "mean": 3.0,
+                "sem": 3.0,
+                "trial_index": 2,
+                "metric_name": "a",
+                "updated_parameters": {"x": 1, "y": "b", "z": 0.25},
+                "mean_t": np.array([3.0]),
+                "covariance_t": np.array([[9.0]]),
+                "z": 0.25,
+                "timestamp": 25,
+            },
+            0.75: {
+                "arm_name": "2_1",
+                "parameters": {"x": 1, "y": "b", "z": 0.75},
+                "mean": 3.0,
+                "sem": 3.0,
+                "trial_index": 2,
+                "metric_name": "a",
+                "updated_parameters": {"x": 1, "y": "b", "z": 0.75},
+                "mean_t": np.array([3.0]),
+                "covariance_t": np.array([[9.0]]),
+                "z": 0.75,
+                "timestamp": 25,
+            },
+        }
+        arms = {
+            obs["arm_name"]: Arm(name=obs["arm_name"], parameters=obs["parameters"])
+            for _, obs in truth.items()
+        }
+        experiment = Mock()
+        experiment._trial_indices_by_status = {status: set() for status in TrialStatus}
+        trials = {
+            obs["trial_index"]: (
+                Trial(experiment, GeneratorRun(arms=[arms[obs["arm_name"]]]))
+            )
+            for _, obs in list(truth.items())[:-1]
+            if not obs["arm_name"].startswith("2")
+        }
+        batch = BatchTrial(experiment, GeneratorRun(arms=[arms["2_0"], arms["2_1"]]))
+        trials.update({2: batch})
+        trials.get(1).mark_abandoned()
+        trials.get(2).mark_arm_abandoned(arm_name="2_1")
+        type(experiment).arms_by_name = PropertyMock(return_value=arms)
+        type(experiment).trials = PropertyMock(return_value=trials)
+
+        df = pd.DataFrame(list(truth.values()))[
+            ["arm_name", "trial_index", "mean", "sem", "metric_name"]
+        ]
+        data = Data(df=df)
+
+        # 1 arm is abandoned and 1 trial is abandoned, so only 2 observations should be
+        # included.
+        obs_no_abandoned = observations_from_data(experiment, data)
+        self.assertEqual(len(obs_no_abandoned), 2)
+
+        # 1 arm is abandoned and 1 trial is abandoned, so only 2 observations should be
+        # included.
+        obs_with_abandoned = observations_from_data(
+            experiment, data, include_abandoned=True
+        )
+        self.assertEqual(len(obs_with_abandoned), 4)
 
     def testObservationsFromDataWithSomeMissingTimes(self):
         truth = [

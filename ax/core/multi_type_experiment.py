@@ -7,10 +7,11 @@
 import logging
 from typing import Any, Dict, List, Optional, Set
 
+from ax.core.abstract_data import AbstractDataFrameData
 from ax.core.arm import Arm
 from ax.core.base_trial import BaseTrial
 from ax.core.data import Data
-from ax.core.experiment import Experiment
+from ax.core.experiment import DataType, Experiment
 from ax.core.metric import Metric
 from ax.core.optimization_config import OptimizationConfig
 from ax.core.runner import Runner
@@ -50,6 +51,7 @@ class MultiTypeExperiment(Experiment):
         is_test: bool = False,
         experiment_type: Optional[str] = None,
         properties: Optional[Dict[str, Any]] = None,
+        default_data_type: Optional[DataType] = None,
     ) -> None:
         """Inits Experiment.
 
@@ -66,6 +68,7 @@ class MultiTypeExperiment(Experiment):
             is_test: Convenience metadata tracker for the user to mark test experiments.
             experiment_type: The class of experiments this one belongs to.
             properties: Dictionary of this experiment's properties.
+            default_data_type: Enum representing the data type this experiment uses.
         """
 
         self._default_trial_type = default_trial_type
@@ -94,6 +97,7 @@ class MultiTypeExperiment(Experiment):
             is_test=is_test,
             experiment_type=experiment_type,
             properties=properties,
+            default_data_type=default_data_type,
         )
 
     def add_trial_type(self, trial_type: str, runner: Runner) -> "MultiTypeExperiment":
@@ -182,8 +186,10 @@ class MultiTypeExperiment(Experiment):
         return self
 
     @copy_doc(Experiment.fetch_data)
-    def fetch_data(self, metrics: Optional[List[Metric]] = None, **kwargs: Any) -> Data:
-        return Data.from_multiple_data(
+    def fetch_data(
+        self, metrics: Optional[List[Metric]] = None, **kwargs: Any
+    ) -> AbstractDataFrameData:
+        return self.default_data_constructor.from_multiple_data(
             [
                 trial.fetch_data(**kwargs, metrics=metrics)
                 if trial.status.expecting_data
@@ -195,7 +201,7 @@ class MultiTypeExperiment(Experiment):
     @copy_doc(Experiment._fetch_trial_data)
     def _fetch_trial_data(
         self, trial_index: int, metrics: Optional[List[Metric]] = None, **kwargs: Any
-    ) -> Data:
+    ) -> AbstractDataFrameData:
         trial = self.trials[trial_index]
         metrics = [
             metric

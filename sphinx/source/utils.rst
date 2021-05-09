@@ -154,9 +154,28 @@ Statstools
     :undoc-members:
     :show-inheritance:
 
+Storage
+---------------
+
+Deletion
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.utils.storage.sqa.delete
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 
 Testing
 ---------------
+
+Backend Simulator
+~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.utils.testing.backend_simulator
+    :members:
+    :undoc-members:
+    :show-inheritance:
 
 Benchmark Stubs
 ~~~~~~~~~~~~~~~~

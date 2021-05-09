@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+import torch
+from ax.core.search_space import SearchSpaceDigest
 from ax.core.types import TConfig
 from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
 from ax.models.torch.botorch_modular.surrogate import Surrogate
@@ -45,8 +47,8 @@ class Acquisition(Base):
     Args:
         surrogate: Surrogate model, with which this acquisition function
             will be used.
-        bounds: A list of (lower, upper) tuples for each column of X in
-            the training data of the surrogate model.
+        search_space_digest: A SearchSpaceDigest object containing
+            metadata about the search space (e.g. bounds, parameter types).
         objective_weights: The objective is to maximize a weighted sum of
             the columns of f(x). These are the weights.
         botorch_acqf_class: Type of BoTorch `AcquistitionFunction` that
@@ -68,8 +70,6 @@ class Acquisition(Base):
             A x <= b. (Not used by single task models)
         fixed_features: A map {feature_index: value} for features that
             should be fixed to a particular value during generation.
-        target_fidelities: Optional mapping from parameter name to its
-            target fidelity, applicable to fidelity parameters only.
     """
 
     surrogate: Surrogate
@@ -85,7 +85,7 @@ class Acquisition(Base):
     def __init__(
         self,
         surrogate: Surrogate,
-        bounds: List[Tuple[float, float]],
+        search_space_digest: SearchSpaceDigest,
         objective_weights: Tensor,
         botorch_acqf_class: Optional[Type[AcquisitionFunction]] = None,
         options: Optional[Dict[str, Any]] = None,
@@ -93,7 +93,7 @@ class Acquisition(Base):
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
+        objective_thresholds: Optional[Tensor] = None,
     ) -> None:
         if not botorch_acqf_class and not self.default_botorch_acqf_class:
             raise ValueError(
@@ -115,19 +115,25 @@ class Acquisition(Base):
         )
         X_pending, X_observed = _get_X_pending_and_observed(
             Xs=Xs,
-            pending_observations=pending_observations,
             objective_weights=objective_weights,
+            bounds=search_space_digest.bounds,
+            pending_observations=pending_observations,
             outcome_constraints=outcome_constraints,
-            bounds=bounds,
             linear_constraints=linear_constraints,
             fixed_features=fixed_features,
         )
 
         # Subset model only to the outcomes we need for the optimization.
         if self.options.get(Keys.SUBSET_MODEL, True):
-            model, objective_weights, outcome_constraints, _ = subset_model(
+            (
+                model,
+                objective_weights,
+                outcome_constraints,
+                objective_thresholds,
+            ) = subset_model(
                 self.surrogate.model,
                 objective_weights=objective_weights,
+                objective_thresholds=objective_thresholds,
                 outcome_constraints=outcome_constraints,
             )
         else:
@@ -136,18 +142,18 @@ class Acquisition(Base):
         objective = self._get_botorch_objective(
             model=model,
             objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
             outcome_constraints=outcome_constraints,
             X_observed=X_observed,
         )
         model_deps = self.compute_model_dependencies(
             surrogate=surrogate,
-            bounds=bounds,
+            search_space_digest=search_space_digest,
             objective_weights=objective_weights,
             pending_observations=pending_observations,
             outcome_constraints=outcome_constraints,
             linear_constraints=linear_constraints,
             fixed_features=fixed_features,
-            target_fidelities=target_fidelities,
             options=self.options,
         )
         X_baseline = X_observed
@@ -158,6 +164,7 @@ class Acquisition(Base):
         self._instantiate_acqf(
             model=model,
             objective=objective,
+            objective_thresholds=objective_thresholds,
             model_dependent_kwargs=model_deps,
             X_pending=X_pending,
             X_baseline=X_baseline,
@@ -165,8 +172,8 @@ class Acquisition(Base):
 
     def optimize(
         self,
-        bounds: Tensor,
         n: int,
+        search_space_digest: SearchSpaceDigest,
         optimizer_class: Optional[Optimizer] = None,
         inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
@@ -177,9 +184,12 @@ class Acquisition(Base):
         candidates and their associated acquisition function values.
         """
         optimizer_options = optimizer_options or {}
+        bounds = torch.tensor(
+            search_space_digest.bounds, dtype=self.dtype, device=self.device
+        ).transpose(0, 1)
         # NOTE: Could make use of `optimizer_class` when its added to BoTorch.
         return optimize_acqf(
-            self.acqf,
+            acq_function=self.acqf,
             bounds=bounds,
             q=n,
             inequality_constraints=inequality_constraints,
@@ -207,16 +217,15 @@ class Acquisition(Base):
     @copy_doc(Surrogate.best_in_sample_point)
     def best_point(
         self,
-        bounds: List[Tuple[float, float]],
+        search_space_digest: SearchSpaceDigest,
         objective_weights: Tensor,
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
         options: Optional[TConfig] = None,
     ) -> Tuple[Tensor, float]:
         return self.surrogate.best_in_sample_point(
-            bounds=bounds,
+            search_space_digest=search_space_digest,
             objective_weights=objective_weights,
             outcome_constraints=outcome_constraints,
             linear_constraints=linear_constraints,
@@ -227,13 +236,12 @@ class Acquisition(Base):
     def compute_model_dependencies(
         self,
         surrogate: Surrogate,
-        bounds: List[Tuple[float, float]],
+        search_space_digest: SearchSpaceDigest,
         objective_weights: Tensor,
         pending_observations: Optional[List[Tensor]] = None,
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
         options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Computes inputs to acquisition function class based on the given
@@ -250,8 +258,8 @@ class Acquisition(Base):
         Args:
             surrogate: The surrogate object containing the BoTorch `Model`,
                 with which this `Acquisition` is to be used.
-            bounds: A list of (lower, upper) tuples for each column of X in
-                the training data of the surrogate model.
+            search_space_digest: A SearchSpaceDigest object containing
+                metadata about the search space (e.g. bounds, parameter types).
             objective_weights: The objective is to maximize a weighted sum of
                 the columns of f(x). These are the weights.
             pending_observations: A list of tensors, each of which contains
@@ -267,8 +275,6 @@ class Acquisition(Base):
                 A x <= b. (Not used by single task models)
             fixed_features: A map {feature_index: value} for features that
                 should be fixed to a particular value during generation.
-            target_fidelities: Optional mapping from parameter name to its
-                target fidelity, applicable to fidelity parameters only.
             options: The `options` kwarg dict, passed on initialization of
                 the `Acquisition` object.
 
@@ -277,10 +283,19 @@ class Acquisition(Base):
         """
         return {}
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.surrogate.dtype
+
+    @property
+    def device(self) -> torch.device:
+        return self.surrogate.device
+
     def _get_botorch_objective(
         self,
         model: Model,
         objective_weights: Tensor,
+        objective_thresholds: Optional[Tensor] = None,
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         X_observed: Optional[Tensor] = None,
     ) -> AcquisitionObjective:
@@ -299,6 +314,7 @@ class Acquisition(Base):
         model: Model,
         objective: AcquisitionObjective,
         model_dependent_kwargs: Dict[str, Any],
+        objective_thresholds: Optional[Tensor] = None,
         X_pending: Optional[Tensor] = None,
         X_baseline: Optional[Tensor] = None,
     ) -> None:

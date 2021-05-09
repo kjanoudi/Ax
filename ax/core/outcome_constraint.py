@@ -11,7 +11,7 @@ from typing import Dict, Optional, List, Iterable, Tuple
 
 from ax.core.metric import Metric
 from ax.core.types import ComparisonOp
-from ax.utils.common.base import Base
+from ax.utils.common.base import SortableBase
 from ax.utils.common.logger import get_logger
 
 
@@ -25,7 +25,7 @@ LOWER_BOUND_MISMATCH: Dict[str, str] = {"bound": "Lower", "is_better": "lower"}
 UPPER_BOUND_MISMATCH: Dict[str, str] = {"bound": "Upper", "is_better": "higher"}
 
 
-class OutcomeConstraint(Base):
+class OutcomeConstraint(SortableBase):
     """Base class for representing outcome constraints.
 
     Outcome constraints may of the form metric >= bound or metric <= bound,
@@ -102,6 +102,10 @@ class OutcomeConstraint(Base):
         relative = "%" if self.relative else ""
         return f"OutcomeConstraint({self.metric.name} {op} {self.bound}{relative})"
 
+    @property
+    def _unique_id(self) -> str:
+        return str(self)
+
 
 class ObjectiveThreshold(OutcomeConstraint):
     """Class for representing Objective Thresholds.
@@ -142,7 +146,12 @@ class ObjectiveThreshold(OutcomeConstraint):
             )
         elif op is None:
             op = ComparisonOp.LEQ if metric.lower_is_better else ComparisonOp.GEQ
-        super().__init__(metric=metric, op=op, bound=bound, relative=relative)
+
+        # It's likely that the metric passed into the ObjectiveThreshold constructor
+        # is the same instance as the metric in the Objective. Thus, we have to clone
+        # the metric passed in here to ensure a 1:1 relationship between user-facing
+        # objects and DB objects.
+        super().__init__(metric=metric.clone(), op=op, bound=bound, relative=relative)
 
     def clone(self) -> ObjectiveThreshold:
         """Create a copy of this ObjectiveThreshold."""

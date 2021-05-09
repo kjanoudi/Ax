@@ -8,17 +8,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Type
 
+from ax.core.abstract_data import AbstractDataFrameData
 from ax.core.data import Data
-from ax.utils.common.base import Base
+from ax.utils.common.base import SortableBase
 from ax.utils.common.serialization import extract_init_args, serialize_init_args
-
+from ax.utils.common.typeutils import checked_cast
 
 if TYPE_CHECKING:  # pragma: no cover
     # import as module to make sphinx-autodoc-typehints happy
     from ax import core  # noqa F401
 
 
-class Metric(Base):
+class Metric(SortableBase):
     """Base class for representing metrics.
 
     The `fetch_trial_data` method is the essential method to override when
@@ -31,6 +32,8 @@ class Metric(Base):
         lower_is_better: Flag for metrics which should be minimized.
         properties: Properties specific to a particular metric.
     """
+
+    data_constructor: Type[Data] = Data
 
     def __init__(
         self,
@@ -96,7 +99,9 @@ class Metric(Base):
         """
         return extract_init_args(args=args, class_=cls)
 
-    def fetch_trial_data(self, trial: core.base_trial.BaseTrial, **kwargs: Any) -> Data:
+    def fetch_trial_data(
+        self, trial: core.base_trial.BaseTrial, **kwargs: Any
+    ) -> AbstractDataFrameData:
         """Fetch data for one trial."""
         raise NotImplementedError(
             f"Metric {self.name} does not implement data-fetching logic."
@@ -104,31 +109,34 @@ class Metric(Base):
 
     def fetch_experiment_data(
         self, experiment: core.experiment.Experiment, **kwargs: Any
-    ) -> Data:
+    ) -> AbstractDataFrameData:
         """Fetch this metric's data for an experiment.
 
         Default behavior is to fetch data from all trials expecting data
         and concatenate the results.
         """
-        return Data.from_multiple_data(
+        return self.data_constructor.from_multiple_data(
             [
-                self.fetch_trial_data(trial, **kwargs)
+                checked_cast(
+                    self.data_constructor, self.fetch_trial_data(trial, **kwargs)
+                )
                 if trial.status.expecting_data
-                else Data()
+                else self.data_constructor()
                 for trial in experiment.trials.values()
-            ]
+            ],
         )
 
     @classmethod
     def fetch_trial_data_multi(
         cls, trial: core.base_trial.BaseTrial, metrics: Iterable[Metric], **kwargs: Any
-    ) -> Data:
+    ) -> AbstractDataFrameData:
         """Fetch multiple metrics data for one trial.
 
         Default behavior calls `fetch_trial_data` for each metric.
         Subclasses should override this to trial data computation for multiple metrics.
         """
-        dat = Data.from_multiple_data(
+        dat = cls.data_constructor.from_multiple_data(
+            # pyre-fixme [6]: Expect `Iterable[Data]` got `List[AbstractDataFrameData]`
             [metric.fetch_trial_data(trial, **kwargs) for metric in metrics]
         )
         return dat
@@ -140,17 +148,18 @@ class Metric(Base):
         metrics: Iterable[Metric],
         trials: Optional[Iterable[core.base_trial.BaseTrial]] = None,
         **kwargs: Any,
-    ) -> Data:
+    ) -> AbstractDataFrameData:
         """Fetch multiple metrics data for an experiment.
 
         Default behavior calls `fetch_trial_data_multi` for each trial.
         Subclasses should override to batch data computation across trials + metrics.
         """
-        return Data.from_multiple_data(
+        return cls.data_constructor.from_multiple_data(
+            # pyre-fixme [6]: Expect `Iterable[Data]` got `List[AbstractDataFrameData]`
             [
                 cls.fetch_trial_data_multi(trial, metrics, **kwargs)
                 if trial.status.expecting_data
-                else Data()
+                else cls.data_constructor()
                 for trial in (experiment.trials.values() if trials is None else trials)
             ]
         )
@@ -162,7 +171,7 @@ class Metric(Base):
         metrics: Iterable[Metric],
         trials: Optional[Iterable[core.base_trial.BaseTrial]] = None,
         **kwargs: Any,
-    ) -> Data:
+    ) -> AbstractDataFrameData:
         """Fetch or lookup (with fallback to fetching) data for given metrics,
         depending on whether they are available while running.
 
@@ -193,12 +202,13 @@ class Metric(Base):
             completed_trials = [t for t in trials if t.status.is_completed]
 
         if not completed_trials:
-            return Data()
+            return cls.data_constructor()
 
         trials_data = []
         for trial in completed_trials:
             cached_trial_data = experiment.lookup_data_for_trial(
-                trial_index=trial.index
+                trial_index=trial.index,
+                merge_trial_data=kwargs.get("merge_trial_data", False),
             )[0]
 
             cached_metric_names = cached_trial_data.metric_names
@@ -219,24 +229,33 @@ class Metric(Base):
 
             except NotImplementedError:
                 # Metric does not implement fetching logic and only uses lookup.
-                fetched_trial_data = Data()
+                fetched_trial_data = cls.data_constructor()
 
-            final_data = Data.from_multiple_data(
+            final_data = cls.data_constructor.from_multiple_data(
+                # pyre-fixme [6]: Incompatible paramtype: Expected `Data`
+                #   but got `AbstractDataFrameData`.
                 [cached_trial_data, fetched_trial_data]
             )
             if not final_data.df.empty:
                 experiment.attach_data(final_data)
             trials_data.append(final_data)
 
-        return Data.from_multiple_data(
+        return cls.data_constructor.from_multiple_data(
             trials_data, subset_metrics=[m.name for m in metrics]
         )
 
     def clone(self) -> "Metric":
         """Create a copy of this Metric."""
-        return Metric(name=self.name, lower_is_better=self.lower_is_better)
+        cls = type(self)
+        return cls(
+            **serialize_init_args(self),
+        )
 
     def __repr__(self) -> str:
         return "{class_name}('{metric_name}')".format(
             class_name=self.__class__.__name__, metric_name=self.name
         )
+
+    @property
+    def _unique_id(self) -> str:
+        return str(self)

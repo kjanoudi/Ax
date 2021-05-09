@@ -30,7 +30,7 @@ from ax.storage.sqa_store.json import (
 )
 from ax.storage.sqa_store.sqa_enum import IntEnum, StringEnum
 from ax.storage.sqa_store.timestamp import IntTimestamp
-from ax.storage.utils import DomainType, MetricIntent, ParameterConstraintType
+from ax.storage.utils import DataType, DomainType, MetricIntent, ParameterConstraintType
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -97,9 +97,6 @@ class SQAParameter(Base):
     #  as `Column[typing.Any]`.
     fixed_value: Optional[TParamValue] = Column(JSONEncodedObject)
 
-    immutable_fields = ["name"]
-    unique_id = "name"
-
 
 class SQAParameterConstraint(Base):
     __tablename__: str = "parameter_constraint_v2"
@@ -117,11 +114,6 @@ class SQAParameterConstraint(Base):
     generator_run_id: Optional[int] = Column(Integer, ForeignKey("generator_run_v2.id"))
     # pyre-fixme[8]: Attribute has type `IntEnum`; used as `Column[typing.Any]`.
     type: IntEnum = Column(IntEnum(ParameterConstraintType), nullable=False)
-
-    # ParameterConstraints should never be updated; since they don't have
-    # a field that can be used for a UID, if anything changes,
-    # we should just throw them out and recreate them
-    immutable_fields = ["type", "constraint_dict", "bound"]
 
 
 class SQAMetric(Base):
@@ -164,9 +156,6 @@ class SQAMetric(Base):
     trial_type: Optional[str] = Column(String(NAME_OR_TYPE_FIELD_LENGTH))
     # pyre-fixme[8]: Attribute has type `Optional[str]`; used as `Column[str]`.
     canonical_name: Optional[str] = Column(String(NAME_OR_TYPE_FIELD_LENGTH))
-
-    immutable_fields = ["name"]
-    unique_id = "name"
 
     scalarized_objective_id = Column(Integer, ForeignKey("metric_v2.id"))
 
@@ -215,9 +204,6 @@ class SQAArm(Base):
     # pyre-fixme[8]: Attribute has type `float`; used as `Column[decimal.Decimal]`.
     weight: float = Column(Float, nullable=False, default=1.0)
 
-    immutable_fields = ["parameters"]
-    unique_id = "name"
-
 
 class SQAAbandonedArm(Base):
     __tablename__: str = "abandoned_arm_v2"
@@ -234,9 +220,6 @@ class SQAAbandonedArm(Base):
     )
     # pyre-fixme[8]: Attribute has type `int`; used as `Column[int]`.
     trial_id: int = Column(Integer, ForeignKey("trial_v2.id"))
-
-    immutable_fields = ["name"]
-    unique_id = "name"
 
 
 class SQAGeneratorRun(Base):
@@ -318,9 +301,6 @@ class SQAGeneratorRun(Base):
         "SQAParameterConstraint", cascade="all, delete-orphan", lazy="selectin"
     )
 
-    ignore_during_update_fields = ["time_created"]
-    unique_id = "index"
-
 
 class SQARunner(Base):
     __tablename__: str = "runner"
@@ -361,8 +341,8 @@ class SQAData(Base):
     generation_strategy_id: Optional[int] = Column(
         Integer, ForeignKey("generation_strategy.id")
     )
-
-    unique_id = "time_created"
+    # pyre-fixme[8]: Attribute has type `str`; used as `Column[str]`.
+    structure_metadata_json: str = Column(Text(LONGTEXT_BYTES), nullable=True)
 
 
 class SQAGenerationStrategy(Base):
@@ -453,10 +433,6 @@ class SQATrial(Base):
         "SQARunner", uselist=False, cascade="all, delete-orphan", lazy=False
     )
 
-    unique_id = "index"
-    ignore_during_update_fields = ["time_created"]
-    immutable_fields = ["is_batch"]
-
 
 class SQAExperiment(Base):
     __tablename__: str = "experiment_v2"
@@ -483,6 +459,8 @@ class SQAExperiment(Base):
     time_created: datetime = Column(IntTimestamp, nullable=False)
     # pyre-fixme[8]: Attribute has type `Optional[str]`; used as `Column[str]`.
     default_trial_type: Optional[str] = Column(String(NAME_OR_TYPE_FIELD_LENGTH))
+    # pyre-fixme[8]: Attribute has type `DataType`; used as `Column[typing.Any]`.
+    default_data_type: DataType = Column(IntEnum(DataType), nullable=True)
 
     # relationships
     # Trials and experiments are mutable, so the children relationships need
@@ -514,6 +492,3 @@ class SQAExperiment(Base):
         uselist=False,
         lazy=True,
     )
-
-    immutable_fields = ["name"]
-    ignore_during_update_fields = ["time_created"]

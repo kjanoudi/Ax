@@ -8,11 +8,12 @@ import inspect
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
+from ax.core.abstract_data import AbstractDataFrameData
 from ax.core.arm import Arm
 from ax.core.base_trial import BaseTrial, TrialStatus
 from ax.core.batch_trial import BatchTrial
 from ax.core.data import Data
-from ax.core.experiment import Experiment
+from ax.core.experiment import DataType, Experiment
 from ax.core.metric import Metric
 from ax.core.objective import Objective
 from ax.core.optimization_config import OptimizationConfig
@@ -62,6 +63,7 @@ class SimpleExperiment(Experiment):
             if any.
         status_quo: Arm representing existing "control" arm.
         properties: Dictionary of this experiment's properties.
+        default_data_type: Enum representing the data type this experiment uses.
     """
 
     _evaluation_function: TEvaluationFunction
@@ -76,6 +78,7 @@ class SimpleExperiment(Experiment):
         outcome_constraints: Optional[List[OutcomeConstraint]] = None,
         status_quo: Optional[Arm] = None,
         properties: Optional[Dict[str, Any]] = None,
+        default_data_type: Optional[DataType] = None,
     ) -> None:
         optimization_config = OptimizationConfig(
             objective=Objective(
@@ -90,6 +93,7 @@ class SimpleExperiment(Experiment):
             optimization_config=optimization_config,
             status_quo=status_quo,
             properties=properties,
+            default_data_type=default_data_type,
         )
         self._evaluation_function = evaluation_function
 
@@ -98,7 +102,7 @@ class SimpleExperiment(Experiment):
     def is_simple_experiment(self):
         return True
 
-    def eval_trial(self, trial: BaseTrial) -> Data:
+    def eval_trial(self, trial: BaseTrial) -> AbstractDataFrameData:
         """
         Evaluate trial arms with the evaluation function of this
         experiment.
@@ -146,8 +150,10 @@ class SimpleExperiment(Experiment):
         function passed as argument to this SimpleExperiment.
         """
 
+        # TODO(jej)[T87591836] Support non-`Data` data types.
         return Data.from_multiple_data(
-            [
+            [  # pyre-fixme [6]: Incompatible paramtype: Expected `Data`
+                #   but got `AbstractDataFrameData`.
                 self.eval_trial(trial)
                 for trial in self.trials.values()
                 if trial.status != TrialStatus.FAILED
@@ -219,7 +225,7 @@ class SimpleExperiment(Experiment):
     @copy_doc(Experiment._fetch_trial_data)
     def _fetch_trial_data(
         self, trial_index: int, metrics: Optional[List[Metric]] = None, **kwargs: Any
-    ) -> Data:
+    ) -> AbstractDataFrameData:
         return self.eval_trial(self.trials[trial_index])
 
     @copy_doc(Experiment.add_tracking_metric)

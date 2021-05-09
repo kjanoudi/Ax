@@ -8,8 +8,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
+from dataclasses import dataclass
 from inspect import signature
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
 
 import pandas as pd
 from ax.core.base_trial import BaseTrial, TrialStatus
@@ -24,13 +25,11 @@ from ax.exceptions.generation_strategy import (
 )
 from ax.modelbridge.base import ModelBridge
 from ax.modelbridge.registry import (
-    Models,
     ModelRegistryBase,
     _combine_model_kwargs_and_state,
     get_model_from_generator_run,
 )
-from ax.utils.common.base import Base
-from ax.utils.common.equality import equality_typechecker, object_attribute_dicts_equal
+from ax.utils.common.base import Base, SortableBase
 from ax.utils.common.kwargs import consolidate_kwargs, get_function_argument_names
 from ax.utils.common.logger import _round_floats_for_logging, get_logger
 from ax.utils.common.typeutils import checked_cast, not_none
@@ -49,7 +48,8 @@ def _filter_kwargs(function: Callable, **kwargs: Any) -> Any:
     return {k: v for k, v in kwargs.items() if k in signature(function).parameters}
 
 
-class GenerationStep(NamedTuple):
+@dataclass
+class GenerationStep(SortableBase):
     """One step in the generation strategy, corresponds to a single model.
     Describes the model, how many trials will be generated with this model, what
     minimum number of observations is required to proceed to the next model, etc.
@@ -115,7 +115,6 @@ class GenerationStep(NamedTuple):
     model_kwargs: Optional[Dict[str, Any]] = None
     # Kwargs to pass into the Model's `.gen` function.
     model_gen_kwargs: Optional[Dict[str, Any]] = None
-    # pyre-ignore[15]: inconsistent override
     index: int = -1  # Index of this step, set internally.
 
     @property
@@ -124,17 +123,17 @@ class GenerationStep(NamedTuple):
         # so we use Models member (str) value if former and function name if latter.
         if isinstance(self.model, ModelRegistryBase):
             return checked_cast(str, checked_cast(ModelRegistryBase, self.model).value)
-        if callable(self.model):
+        try:
+            # `model` is defined via a factory function.
             return self.model.__name__  # pyre-fixme[16]: union has no attr __name__
-        raise TypeError(  # pragma: no cover
-            "`model` was not a member of `Models` or a callable."
-        )
+        except Exception:
+            raise TypeError(  # pragma: no cover
+                f"`model` {self.model} was not a member of `Models` or a function."
+            )
 
-    @equality_typechecker
-    def __eq__(self, other: GenerationStep) -> bool:
-        return object_attribute_dicts_equal(
-            one_dict=self._asdict(), other_dict=other._asdict()
-        )
+    @property
+    def _unique_id(self) -> str:
+        return str(self.index)
 
 
 class GenerationStrategy(Base):
@@ -185,7 +184,7 @@ class GenerationStrategy(Base):
                     )
             elif step.num_trials < 1:  # pragma: no cover
                 raise ValueError("`num_trials` must be positive or -1 for all models.")
-            self._steps[idx] = step._replace(index=idx)
+            step.index = idx
             if not isinstance(step.model, ModelRegistryBase):
                 self._uses_registered_models = False
         if not self._uses_registered_models:
@@ -412,7 +411,7 @@ class GenerationStrategy(Base):
             **kwargs,
         )[0]
 
-    def clone_reset(self) -> "GenerationStrategy":
+    def clone_reset(self) -> GenerationStrategy:
         """Copy this generation strategy without it's state."""
         return GenerationStrategy(name=self.name, steps=self._steps)
 
@@ -424,8 +423,12 @@ class GenerationStrategy(Base):
             num_trials = (
                 f"{step.num_trials}" if step.num_trials != -1 else remaining_trials
             )
-            if isinstance(step.model, Models):
-                repr += f"{step.model.value} for {num_trials} trials, "
+            try:
+                model_name = step.model_name
+            except TypeError:
+                model_name = "model with unknown name"
+
+            repr += f"{model_name} for {num_trials} trials, "
         repr = repr[:-2]
         repr += "])"
         return repr
@@ -500,12 +503,7 @@ class GenerationStrategy(Base):
             )
 
         model = not_none(self.model)
-        # TODO[T79183560]: Cloning generator runs here is a temporary measure
-        # to ensure a 1-to-1 correspondence between user-facing generator runs
-        # and their stored SQL counterparts. This will be no longer needed soon
-        # as we move to use foreign keys to avoid storing generotor runs on both
-        # experiment and generation strategy like we do now.
-        generator_run_clones = []
+        generator_runs = []
         for _ in range(num_generator_runs):
             try:
                 generator_run = model.gen(
@@ -518,17 +516,17 @@ class GenerationStrategy(Base):
                 )
                 generator_run._generation_step_index = self._curr.index
                 self._generator_runs.append(generator_run)
-                generator_run_clones.append(generator_run.clone())
+                generator_runs.append(generator_run)
             except DataRequiredError as err:
                 # Model needs more data, so we log the error and return
                 # as many generator runs as we were able to produce, unless
                 # no trials were produced at all (in which case its safe to raise).
-                if len(generator_run_clones) == 0:
+                if len(generator_runs) == 0:
                     raise
                 logger.debug(f"Model required more data: {err}.")
                 break
 
-        return generator_run_clones
+        return generator_runs
 
     # ------------------------- Model selection logic helpers. -------------------------
 
@@ -635,11 +633,14 @@ class GenerationStrategy(Base):
                 "implement fetching logic (check your metrics) or no data was "
                 "attached to experiment for completed trials."
             )
+        # TODO(jej)[T87591836] Support non-`Data` data types.
         if isinstance(self._curr.model, ModelRegistryBase):
+            # pyre-fixme [6]: Incompat param: Expect `Data` got `AbstractDataFrameData`
             self._set_current_model_from_models_enum(data=data, **model_kwargs)
         else:
             # If model was not specified as Models member, it was specified as a
             # factory function.
+            # pyre-fixme [6]: Incompat param: Expect `Data` got `AbstractDataFrameData`
             self._set_current_model_from_factory_function(data=data, **model_kwargs)
 
     def _update_current_model(self, data: Optional[Data]) -> None:
@@ -668,13 +669,12 @@ class GenerationStrategy(Base):
             return
         else:
             new_data = Data(
-                # pyre-fixme[6]: Expected `Optional[pd.core.frame.DataFrame]` for
-                #  1st param but got `Series`.
                 df=data.df[data.df.trial_index.isin(newly_completed_trials)]
             )
         # We definitely have non-empty new data by now.
         trial_indices_in_new_data = sorted(new_data.df["trial_index"].unique())
         logger.info(f"Updating model with data for trials: {trial_indices_in_new_data}")
+        # pyre-fixme [6]: Incompat param: Expected `Data` got `AbstractDataFrameData`
         not_none(self._model).update(experiment=self.experiment, new_data=new_data)
 
     def _set_current_model_from_models_enum(self, data: Data, **kwargs: Any) -> None:
@@ -688,7 +688,7 @@ class GenerationStrategy(Base):
         """Instantiate the current model, provided through a callable factory
         function, with the provided data and kwargs."""
         model = self._curr.model
-        assert not isinstance(model, Models) and callable(model)
+        assert not isinstance(model, ModelRegistryBase) and callable(model)
         self._model = self._curr.model(
             **_filter_kwargs(
                 self._curr.model,
@@ -718,6 +718,7 @@ class GenerationStrategy(Base):
         self._model = get_model_from_generator_run(
             generator_run=generator_run,
             experiment=self.experiment,
+            # pyre-fixme [6]: Incompat param: Expect `Data` got `AbstractDataFrameData`
             data=self.experiment.fetch_data(),
             models_enum=models_enum,
         )
@@ -748,7 +749,7 @@ class GenerationStrategy(Base):
         ]
         return completed_now.difference(completed_before)
 
-    def _register_trial_data_update(self, trial: BaseTrial, data: Data) -> None:
+    def _register_trial_data_update(self, trial: BaseTrial) -> None:
         """Registers that a given trial has new data even though it's a trial that has
         been completed before. Useful only for generation steps that have `use_update=
         True`, as the information registered by this function is used for identifying

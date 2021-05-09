@@ -15,8 +15,10 @@ import torch
 from ax.core.arm import Arm
 from ax.core.batch_trial import AbandonedArm, BatchTrial
 from ax.core.data import Data
-from ax.core.experiment import Experiment
+from ax.core.experiment import DataType, Experiment
 from ax.core.generator_run import GeneratorRun
+from ax.core.map_data import MapData
+from ax.core.map_metric import MapMetric
 from ax.core.metric import Metric
 from ax.core.multi_type_experiment import MultiTypeExperiment
 from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
@@ -81,15 +83,28 @@ logger = get_logger(__name__)
 ##############################
 
 
-def get_experiment() -> Experiment:
+def get_experiment(with_status_quo: bool = True) -> Experiment:
     return Experiment(
         name="test",
         search_space=get_search_space(),
         optimization_config=get_optimization_config(),
-        status_quo=get_status_quo(),
+        status_quo=get_status_quo() if with_status_quo else None,
         description="test description",
         tracking_metrics=[Metric(name="tracking")],
         is_test=True,
+    )
+
+
+def get_experiment_with_map_data():
+    return Experiment(
+        name="test_map_data",
+        search_space=get_search_space(),
+        optimization_config=get_map_optimization_config(),
+        status_quo=get_status_quo(),
+        description="test description",
+        tracking_metrics=[MapMetric(name="tracking")],
+        is_test=True,
+        default_data_type=DataType.MAP_DATA,
     )
 
 
@@ -303,6 +318,7 @@ def get_experiment_with_multi_objective() -> Experiment:
 
 def get_branin_experiment_with_multi_objective(
     has_optimization_config: bool = True,
+    has_objective_thresholds: bool = False,
     with_batch: bool = False,
     with_status_quo: bool = False,
     with_fidelity_parameter: bool = False,
@@ -312,7 +328,9 @@ def get_branin_experiment_with_multi_objective(
         search_space=get_branin_search_space(
             with_fidelity_parameter=with_fidelity_parameter
         ),
-        optimization_config=get_branin_multi_objective_optimization_config()
+        optimization_config=get_branin_multi_objective_optimization_config(
+            has_objective_thresholds=has_objective_thresholds
+        )
         if has_optimization_config
         else None,
         runner=SyntheticRunner(),
@@ -332,25 +350,8 @@ def get_branin_experiment_with_multi_objective(
     return exp
 
 
-def get_experiment_with_scalarized_objective() -> Experiment:
+def get_experiment_with_scalarized_objective_and_outcome_constraint() -> Experiment:
     objective = get_scalarized_objective()
-    outcome_constraints = [get_outcome_constraint()]
-    optimization_config = OptimizationConfig(
-        objective=objective, outcome_constraints=outcome_constraints
-    )
-    return Experiment(
-        name="test_experiment_scalarized_objective",
-        search_space=get_search_space(),
-        optimization_config=optimization_config,
-        status_quo=get_status_quo(),
-        description="test experiment with scalarized objective",
-        tracking_metrics=[Metric(name="tracking")],
-        is_test=True,
-    )
-
-
-def get_experiment_with_scalarized_outcome_constraint() -> Experiment:
-    objective = get_objective()
     outcome_constraints = [
         get_outcome_constraint(),
         get_scalarized_outcome_constraint(),
@@ -359,11 +360,11 @@ def get_experiment_with_scalarized_outcome_constraint() -> Experiment:
         objective=objective, outcome_constraints=outcome_constraints
     )
     return Experiment(
-        name="test_experiment_scalarized_constraint",
+        name="test_experiment_scalarized_objective and outcome constraint",
         search_space=get_search_space(),
         optimization_config=optimization_config,
         status_quo=get_status_quo(),
-        description="test experiment with scalarized constraint",
+        description="test experiment with scalarized objective and outcome constraint",
         tracking_metrics=[Metric(name="tracking")],
         is_test=True,
     )
@@ -614,6 +615,30 @@ def get_choice_parameter() -> ChoiceParameter:
     )
 
 
+def get_ordered_choice_parameter() -> ChoiceParameter:
+    return ChoiceParameter(
+        name="y",
+        parameter_type=ParameterType.INT,
+        # Expected `List[typing.Optional[typing.Union[bool, float, str]]]` for 4th
+        # parameter `values` to call
+        # `ax.core.parameter.ChoiceParameter.__init__` but got `List[str]`.
+        values=[1, 2, 3],
+        is_ordered=True,
+    )
+
+
+def get_task_choice_parameter() -> ChoiceParameter:
+    return ChoiceParameter(
+        name="y",
+        parameter_type=ParameterType.INT,
+        # Expected `List[typing.Optional[typing.Union[bool, float, str]]]` for 4th
+        # parameter `values` to call
+        # `ax.core.parameter.ChoiceParameter.__init__` but got `List[str]`.
+        values=[1, 2, 3],
+        is_task=True,
+    )
+
+
 def get_fixed_parameter() -> FixedParameter:
     return FixedParameter(name="z", parameter_type=ParameterType.BOOL, value=True)
 
@@ -730,6 +755,10 @@ def get_objective() -> Objective:
     return Objective(metric=Metric(name="m1"), minimize=False)
 
 
+def get_map_objective() -> Objective:
+    return Objective(metric=MapMetric(name="m1"), minimize=False)
+
+
 def get_multi_objective() -> Objective:
     return MultiObjective(
         metrics=[Metric(name="m1"), Metric(name="m3", lower_is_better=True)],
@@ -784,6 +813,11 @@ def get_optimization_config() -> OptimizationConfig:
     )
 
 
+def get_map_optimization_config() -> OptimizationConfig:
+    objective = get_map_objective()
+    return OptimizationConfig(objective=objective)
+
+
 def get_multi_objective_optimization_config() -> OptimizationConfig:
     objective = get_multi_objective()
     outcome_constraints = [get_outcome_constraint()]
@@ -803,8 +837,25 @@ def get_branin_optimization_config(minimize: bool = False) -> OptimizationConfig
     return OptimizationConfig(objective=get_branin_objective(minimize=minimize))
 
 
-def get_branin_multi_objective_optimization_config() -> OptimizationConfig:
-    return MultiObjectiveOptimizationConfig(objective=get_branin_multi_objective())
+def get_branin_multi_objective_optimization_config(
+    has_objective_thresholds: bool = False,
+) -> OptimizationConfig:
+    objective_thresholds = (
+        [
+            ObjectiveThreshold(
+                metric=get_branin_metric(name="branin_a"), bound=10, op=ComparisonOp.GEQ
+            ),
+            ObjectiveThreshold(
+                metric=get_branin_metric(name="branin_b"), bound=20, op=ComparisonOp.GEQ
+            ),
+        ]
+        if has_objective_thresholds
+        else None
+    )
+    return MultiObjectiveOptimizationConfig(
+        objective=get_branin_multi_objective(),
+        objective_thresholds=objective_thresholds,
+    )
 
 
 def get_augmented_branin_optimization_config() -> OptimizationConfig:
@@ -944,16 +995,53 @@ def get_synthetic_runner() -> SyntheticRunner:
 ##############################
 
 
-def get_data(trial_index: int = 0) -> Data:
+def get_data(
+    metric_name: str = "ax_test_metric",
+    trial_index: int = 0,
+    num_non_sq_arms: int = 4,
+    include_sq: bool = True,
+) -> Data:
+    assert num_non_sq_arms < 5, "Only up to 4 arms currently handled."
+    arm_names = ["status_quo"] if include_sq else []
+    arm_names += [f"{trial_index}_{i}" for i in range(num_non_sq_arms)]
+    num_arms = num_non_sq_arms + 1 if include_sq else num_non_sq_arms
     df_dict = {
         "trial_index": trial_index,
-        "metric_name": "ax_test_metric",
-        "arm_name": ["status_quo"] + [f"{trial_index}_i" for i in range(4)],
-        "mean": [1, 3, 2, 2.25, 1.75],
-        "sem": [0, 0.5, 0.25, 0.40, 0.15],
-        "n": [100, 100, 100, 100, 100],
+        "metric_name": metric_name,
+        "arm_name": arm_names,
+        "mean": [1, 3, 2, 2.25, 1.75][:num_arms],
+        "sem": [0, 0.5, 0.25, 0.40, 0.15][:num_arms],
+        "n": [100, 100, 100, 100, 100][:num_arms],
     }
     return Data(df=pd.DataFrame.from_records(df_dict))
+
+
+def get_map_data(trial_index: int = 0) -> MapData:
+    evaluations = {
+        "status_quo": [
+            ({"epoch": 1}, {"ax_test_metric": (1.0, 0.5)}),
+            ({"epoch": 2}, {"ax_test_metric": (2.0, 0.5)}),
+            ({"epoch": 3}, {"ax_test_metric": (3.0, 0.5)}),
+            ({"epoch": 4}, {"ax_test_metric": (4.0, 0.5)}),
+        ],
+        "0_0": [
+            ({"epoch": 1}, {"ax_test_metric": (3.7, 0.5)}),
+            ({"epoch": 2}, {"ax_test_metric": (3.8, 0.5)}),
+            ({"epoch": 3}, {"ax_test_metric": (3.9, 0.5)}),
+            ({"epoch": 4}, {"ax_test_metric": (4.0, 0.5)}),
+        ],
+        "0_1": [
+            ({"epoch": 1}, {"ax_test_metric": (3.0, 0.5)}),
+            ({"epoch": 2}, {"ax_test_metric": (5.0, 0.5)}),
+            ({"epoch": 3}, {"ax_test_metric": (6.0, 0.5)}),
+            ({"epoch": 4}, {"ax_test_metric": (1.0, 0.5)}),
+        ],
+    }
+    return MapData.from_map_evaluations(
+        evaluations=evaluations,  # pyre-ignore [6]: Spurious param type mismatch.
+        trial_index=0,
+        map_keys=["epoch"],
+    )
 
 
 def get_branin_data(

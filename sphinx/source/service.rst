@@ -16,6 +16,13 @@ Ax Client
     :undoc-members:
     :show-inheritance:
 
+Early Stopping Strategy
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.service.early_stopping_strategy
+    :members:
+    :undoc-members:
+    :show-inheritance:
 
 Managed Loop
 ~~~~~~~~~~~~~~~~
@@ -59,6 +66,15 @@ WithDBSettingsBase
 ~~~~~~~~~~~~~~~~~~
 
 .. automodule:: ax.service.utils.with_db_settings_base
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
+
+Scheduler
+~~~~~~~~~~
+
+.. automodule:: ax.service.scheduler
     :members:
     :undoc-members:
     :show-inheritance:

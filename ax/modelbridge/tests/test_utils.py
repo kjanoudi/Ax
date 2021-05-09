@@ -12,14 +12,21 @@ from ax.core.base_trial import TrialStatus
 from ax.core.data import Data
 from ax.core.generator_run import GeneratorRun
 from ax.core.metric import Metric
-from ax.core.observation import ObservationFeatures
-from ax.core.outcome_constraint import OutcomeConstraint, ScalarizedOutcomeConstraint
+from ax.core.objective import Objective, MultiObjective
+from ax.core.observation import ObservationFeatures, ObservationData
+from ax.core.outcome_constraint import (
+    OutcomeConstraint,
+    ScalarizedOutcomeConstraint,
+    ObjectiveThreshold,
+)
 from ax.core.types import ComparisonOp
 from ax.modelbridge.modelbridge_utils import (
     clamp_observation_features,
     get_pending_observation_features,
     pending_observations_as_array,
     extract_outcome_constraints,
+    extract_objective_thresholds,
+    observation_data_to_array,
 )
 from ax.utils.common.testutils import TestCase
 from ax.utils.testing.core_stubs import get_experiment
@@ -79,6 +86,34 @@ class TestModelbridgeUtils(TestCase):
             ),
             {"tracking": [self.obs_feat], "m2": [self.obs_feat], "m1": [self.obs_feat]},
         )
+        # When an arm is abandoned, it should appear in pending features whether
+        # or not there is data for it.
+        self.batch_trial.mark_arm_abandoned(arm_name="0_0")
+        # Checking with data for all metrics.
+        with patch.object(
+            self.batch_trial,
+            "fetch_data",
+            return_value=Data.from_evaluations(
+                {
+                    self.batch_trial.arms[0].name: {
+                        "m1": (1, 0),
+                        "m2": (1, 0),
+                        "tracking": (1, 0),
+                    }
+                },
+                trial_index=self.trial.index,
+            ),
+        ):
+            self.assertEqual(
+                get_pending_observation_features(
+                    self.experiment, include_failed_as_pending=True
+                ),
+                {
+                    "tracking": [self.obs_feat],
+                    "m2": [self.obs_feat],
+                    "m1": [self.obs_feat],
+                },
+            )
         # Checking with data for all metrics.
         with patch.object(
             self.trial,
@@ -271,3 +306,82 @@ class TestModelbridgeUtils(TestCase):
         self.assertListEqual(list(res[0][1]), [0, -0.5, -0.5])
         self.assertEqual(res[1][0][0], 0)
         self.assertEqual(res[1][1][0], -1)
+
+    def test_extract_objective_thresholds(self):
+        outcomes = ["m1", "m2", "m3", "m4"]
+        objective = MultiObjective(metrics=[Metric(name) for name in outcomes[:3]])
+        objective_thresholds = [
+            ObjectiveThreshold(
+                metric=Metric(name), op=ComparisonOp.LEQ, bound=float(i + 2)
+            )
+            for i, name in enumerate(outcomes[:3])
+        ]
+
+        # None of no thresholds
+        self.assertIsNone(
+            extract_objective_thresholds(
+                objective_thresholds=[], objective=objective, outcomes=outcomes
+            )
+        )
+
+        # Working case
+        obj_t = extract_objective_thresholds(
+            objective_thresholds=objective_thresholds,
+            objective=objective,
+            outcomes=outcomes,
+        )
+        expected_obj_t_not_nan = np.array([2.0, 3.0, 4.0])
+        self.assertTrue(np.array_equal(obj_t[:3], expected_obj_t_not_nan[:3]))
+        self.assertTrue(np.isnan(obj_t[-1]))
+        self.assertEqual(obj_t.shape[0], 4)
+
+        # Fails if threshold not provided for all objective metrics
+        with self.assertRaises(ValueError):
+            extract_objective_thresholds(
+                objective_thresholds=objective_thresholds[:2],
+                objective=objective,
+                outcomes=outcomes,
+            )
+
+        # Fails if number of thresholds doesn't equal number of objectives
+        objective2 = Objective(Metric("m1"))
+        with self.assertRaises(ValueError):
+            extract_objective_thresholds(
+                objective_thresholds=objective_thresholds,
+                objective=objective2,
+                outcomes=outcomes,
+            )
+
+        # Works with a single objective, single threshold
+        obj_t = extract_objective_thresholds(
+            objective_thresholds=objective_thresholds[:1],
+            objective=objective2,
+            outcomes=outcomes,
+        )
+        self.assertEqual(obj_t[0], 2.0)
+        self.assertTrue(np.all(np.isnan(obj_t[1:])))
+        self.assertEqual(obj_t.shape[0], 4)
+
+        # Fails if relative
+        objective_thresholds[2] = ObjectiveThreshold(
+            metric=Metric("m3"), op=ComparisonOp.LEQ, bound=3, relative=True
+        )
+        with self.assertRaises(ValueError):
+            extract_objective_thresholds(
+                objective_thresholds=objective_thresholds,
+                objective=objective,
+                outcomes=outcomes,
+            )
+
+    def testObservationDataToArray(self):
+        outcomes = ["a", "b", "c"]
+        obsd = ObservationData(
+            metric_names=["c", "a", "b"],
+            means=np.array([1, 2, 3]),
+            covariance=np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
+        )
+        Y, Ycov = observation_data_to_array(outcomes=outcomes, observation_data=[obsd])
+        self.assertTrue(np.array_equal(Y, np.array([[2, 3, 1]])))
+        self.assertTrue(
+            np.array_equal(Ycov, np.array([[[5, 6, 4], [8, 9, 7], [2, 3, 1]]]))
+        )

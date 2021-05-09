@@ -4,10 +4,12 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+from ax.core.search_space import SearchSpaceDigest
 from ax.core.types import TCandidateMetadata, TConfig, TGenMetadata
 from ax.models.torch.botorch import get_rounding_func
 from ax.models.torch.botorch_modular.acquisition import Acquisition
@@ -83,6 +85,7 @@ class BoTorchModel(TorchModel, Base):
     surrogate_options: Dict[str, Any]
     _surrogate: Optional[Surrogate]
     _botorch_acqf_class: Optional[Type[AcquisitionFunction]]
+    _search_space_digest: Optional[SearchSpaceDigest] = None
 
     def __init__(
         self,
@@ -132,11 +135,8 @@ class BoTorchModel(TorchModel, Base):
         Xs: List[Tensor],
         Ys: List[Tensor],
         Yvars: List[Tensor],
-        bounds: List[Tuple[float, float]],
-        task_features: List[int],
-        feature_names: List[str],
+        search_space_digest: SearchSpaceDigest,
         metric_names: List[str],
-        fidelity_features: List[int],
         target_fidelities: Optional[Dict[int, float]] = None,
         candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
         state_dict: Optional[Dict[str, Tensor]] = None,
@@ -145,14 +145,16 @@ class BoTorchModel(TorchModel, Base):
         # Ensure that parts of data all have equal lengths.
         validate_data_format(Xs=Xs, Ys=Ys, Yvars=Yvars, metric_names=metric_names)
 
+        # store search space info for later use (e.g. during generation)
+        self._search_space_digest = search_space_digest
+
         # Choose `Surrogate` and undelying `Model` based on properties of data.
         if not self._surrogate:
             self._autoset_surrogate(
                 Xs=Xs,
                 Ys=Ys,
                 Yvars=Yvars,
-                task_features=task_features,
-                fidelity_features=fidelity_features,
+                search_space_digest=search_space_digest,
                 metric_names=metric_names,
             )
 
@@ -161,11 +163,7 @@ class BoTorchModel(TorchModel, Base):
             # but `ListSurrogate` expects a list of them, so `training_data` here is
             # a union of the two.
             training_data=self._mk_training_data(Xs=Xs, Ys=Ys, Yvars=Yvars),
-            bounds=bounds,
-            task_features=task_features,
-            feature_names=feature_names,
-            fidelity_features=fidelity_features,
-            target_fidelities=target_fidelities,
+            search_space_digest=search_space_digest,
             metric_names=metric_names,
             candidate_metadata=candidate_metadata,
             state_dict=state_dict,
@@ -178,16 +176,15 @@ class BoTorchModel(TorchModel, Base):
         Xs: List[Tensor],
         Ys: List[Tensor],
         Yvars: List[Tensor],
-        bounds: List[Tuple[float, float]],
-        task_features: List[int],
-        feature_names: List[str],
+        search_space_digest: SearchSpaceDigest,
         metric_names: List[str],
-        fidelity_features: List[int],
-        target_fidelities: Optional[Dict[int, float]] = None,
         candidate_metadata: Optional[List[List[TCandidateMetadata]]] = None,
     ) -> None:
         if not self._surrogate:
             raise ValueError("Cannot update model that has not been fitted.")
+
+        # store search space info  for later use (e.g. during generation)
+        self._search_space_digest = search_space_digest
 
         # Sometimes the model fit should be restarted from scratch on update, for models
         # that are prone to overfitting. In those cases, `self.warm_start_refit` should
@@ -204,12 +201,8 @@ class BoTorchModel(TorchModel, Base):
             # but `ListSurrogate` expects a list of them, so `training_data` here is
             # a union of the two.
             training_data=self._mk_training_data(Xs=Xs, Ys=Ys, Yvars=Yvars),
-            bounds=bounds,
-            task_features=task_features,
-            feature_names=feature_names,
+            search_space_digest=search_space_digest,
             metric_names=metric_names,
-            fidelity_features=fidelity_features,
-            target_fidelities=target_fidelities,
             candidate_metadata=candidate_metadata,
             state_dict=state_dict,
             refit=self.refit_on_update,
@@ -225,6 +218,7 @@ class BoTorchModel(TorchModel, Base):
         n: int,
         bounds: List[Tuple[float, float]],
         objective_weights: Tensor,
+        objective_thresholds: Optional[Tensor] = None,
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
@@ -233,24 +227,34 @@ class BoTorchModel(TorchModel, Base):
         rounding_func: Optional[Callable[[Tensor], Tensor]] = None,
         target_fidelities: Optional[Dict[int, float]] = None,
     ) -> Tuple[Tensor, Tensor, TGenMetadata, Optional[List[TCandidateMetadata]]]:
+        if self._search_space_digest is None:
+            raise RuntimeError("Must `fit` the model before calling `gen`.")
         acq_options, opt_options = construct_acquisition_and_optimizer_options(
             acqf_options=self.acquisition_options, model_gen_options=model_gen_options
         )
+        # update bounds / target fidelities
+        new_ssd_args = {
+            **dataclasses.asdict(self._search_space_digest),
+            "bounds": bounds,
+            "target_fidelities": target_fidelities or {},
+        }
+        search_space_digest = SearchSpaceDigest(**new_ssd_args)
+
         acqf = self._instantiate_acquisition(
-            bounds=bounds,
+            search_space_digest=search_space_digest,
             objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
             outcome_constraints=outcome_constraints,
             linear_constraints=linear_constraints,
             fixed_features=fixed_features,
             pending_observations=pending_observations,
-            target_fidelities=target_fidelities,
             acq_options=acq_options,
         )
 
         botorch_rounding_func = get_rounding_func(rounding_func)
         candidates, expected_acquisition_value = acqf.optimize(
-            bounds=self._bounds_as_tensor(bounds=bounds),
             n=n,
+            search_space_digest=search_space_digest,
             inequality_constraints=_to_inequality_constraints(
                 linear_constraints=linear_constraints
             ),
@@ -282,23 +286,23 @@ class BoTorchModel(TorchModel, Base):
     def evaluate_acquisition_function(
         self,
         X: Tensor,
-        bounds: List[Tuple[float, float]],
+        search_space_digest: SearchSpaceDigest,
         objective_weights: Tensor,
+        objective_thresholds: Optional[Tensor] = None,
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
         pending_observations: Optional[List[Tensor]] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
         acq_options: Optional[Dict[str, Any]] = None,
     ) -> Tensor:
         acqf = self._instantiate_acquisition(
-            bounds=bounds,
+            search_space_digest=search_space_digest,
             objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
             outcome_constraints=outcome_constraints,
             linear_constraints=linear_constraints,
             fixed_features=fixed_features,
             pending_observations=pending_observations,
-            target_fidelities=target_fidelities,
             acq_options=acq_options,
         )
         return acqf.evaluate(X=X)
@@ -309,11 +313,8 @@ class BoTorchModel(TorchModel, Base):
         Ys_train: List[Tensor],
         Yvars_train: List[Tensor],
         X_test: Tensor,
-        bounds: List[Tuple[float, float]],
-        task_features: List[int],
-        feature_names: List[str],
+        search_space_digest: SearchSpaceDigest,
         metric_names: List[str],
-        fidelity_features: List[int],
     ) -> Tuple[Tensor, Tensor]:
         current_surrogate = self.surrogate
         # If we should be refitting but not warm-starting the refit, set
@@ -335,11 +336,8 @@ class BoTorchModel(TorchModel, Base):
                 Xs=Xs_train,
                 Ys=Ys_train,
                 Yvars=Yvars_train,
-                bounds=bounds,
-                task_features=task_features,
-                feature_names=feature_names,
+                search_space_digest=search_space_digest,
                 metric_names=metric_names,
-                fidelity_features=fidelity_features,
                 state_dict=state_dict,
                 refit=self.refit_on_cv,
             )
@@ -356,8 +354,7 @@ class BoTorchModel(TorchModel, Base):
         Xs: List[Tensor],
         Ys: List[Tensor],
         Yvars: List[Tensor],
-        task_features: List[int],
-        fidelity_features: List[int],
+        search_space_digest: SearchSpaceDigest,
         metric_names: List[str],
     ) -> None:
         """Sets a default surrogate on this model if one was not explicitly
@@ -368,8 +365,7 @@ class BoTorchModel(TorchModel, Base):
         # be chosen given the Yvars and the properties of data.
         botorch_model_class = choose_model_class(
             Yvars=Yvars,
-            task_features=task_features,
-            fidelity_features=fidelity_features,
+            search_space_digest=search_space_digest,
         )
         if use_model_list(Xs=Xs, botorch_model_class=botorch_model_class):
             # If using `ListSurrogate` / `ModelListGP`, pick submodels for each
@@ -377,8 +373,7 @@ class BoTorchModel(TorchModel, Base):
             botorch_submodel_class_per_outcome = {
                 metric_name: choose_model_class(
                     Yvars=[Yvar],
-                    task_features=task_features,
-                    fidelity_features=fidelity_features,
+                    search_space_digest=search_space_digest,
                 )
                 for Yvar, metric_name in zip(Yvars, metric_names)
             }
@@ -393,21 +388,15 @@ class BoTorchModel(TorchModel, Base):
                 botorch_model_class=botorch_model_class, **self.surrogate_options
             )
 
-    def _bounds_as_tensor(self, bounds: List[Tuple[float, float]]) -> Tensor:
-        bounds_ = torch.tensor(
-            bounds, dtype=self.surrogate.dtype, device=self.surrogate.device
-        )
-        return bounds_.transpose(0, 1)
-
     def _instantiate_acquisition(
         self,
-        bounds: List[Tuple[float, float]],
+        search_space_digest: SearchSpaceDigest,
         objective_weights: Tensor,
+        objective_thresholds: Optional[Tensor] = None,
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         linear_constraints: Optional[Tuple[Tensor, Tensor]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
         pending_observations: Optional[List[Tensor]] = None,
-        target_fidelities: Optional[Dict[int, float]] = None,
         acq_options: Optional[Dict[str, Any]] = None,
     ) -> Acquisition:
         if not self._botorch_acqf_class:
@@ -416,13 +405,13 @@ class BoTorchModel(TorchModel, Base):
         return self.acquisition_class(
             surrogate=self.surrogate,
             botorch_acqf_class=self.botorch_acqf_class,
-            bounds=bounds,
+            search_space_digest=search_space_digest,
             objective_weights=objective_weights,
+            objective_thresholds=objective_thresholds,
             outcome_constraints=outcome_constraints,
             linear_constraints=linear_constraints,
             fixed_features=fixed_features,
             pending_observations=pending_observations,
-            target_fidelities=target_fidelities,
             options=acq_options,
         )
 

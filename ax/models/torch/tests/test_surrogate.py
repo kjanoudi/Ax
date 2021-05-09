@@ -7,6 +7,7 @@
 from unittest.mock import patch
 
 import torch
+from ax.core.search_space import SearchSpaceDigest
 from ax.models.torch.botorch_modular.acquisition import Acquisition
 from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.utils.common.constants import Keys
@@ -45,11 +46,12 @@ class SurrogateTest(TestCase):
         self.surrogate = Surrogate(
             botorch_model_class=self.botorch_model_class, mll_class=self.mll_class
         )
-        self.task_features = []
-        self.feature_names = ["x1", "x2"]
+        self.search_space_digest = SearchSpaceDigest(
+            feature_names=["x1", "x2"],
+            bounds=self.bounds,
+            target_fidelities={1: 1.0},
+        )
         self.metric_names = ["y"]
-        self.fidelity_features = []
-        self.target_fidelities = {1: 1.0}
         self.fixed_features = {1: 2.0}
         self.refit = True
         self.objective_weights = torch.tensor(
@@ -91,18 +93,20 @@ class SurrogateTest(TestCase):
 
     def test_dtype_property(self):
         self.surrogate.construct(
-            training_data=self.training_data, fidelity_features=self.fidelity_features
+            training_data=self.training_data,
+            fidelity_features=self.search_space_digest.fidelity_features,
         )
         self.assertEqual(self.dtype, self.surrogate.dtype)
 
     def test_device_property(self):
         self.surrogate.construct(
-            training_data=self.training_data, fidelity_features=self.fidelity_features
+            training_data=self.training_data,
+            fidelity_features=self.search_space_digest.fidelity_features,
         )
         self.assertEqual(self.device, self.surrogate.device)
 
-    def test_from_BoTorch(self):
-        surrogate = Surrogate.from_BoTorch(
+    def test_from_botorch(self):
+        surrogate = Surrogate.from_botorch(
             self.botorch_model_class(**self.surrogate_kwargs)
         )
         self.assertIsInstance(surrogate.model, self.botorch_model_class)
@@ -114,10 +118,11 @@ class SurrogateTest(TestCase):
             # Base `Model` does not implement `construct_inputs`.
             Surrogate(botorch_model_class=Model).construct(
                 training_data=self.training_data,
-                fidelity_features=self.fidelity_features,
+                fidelity_features=self.search_space_digest.fidelity_features,
             )
         self.surrogate.construct(
-            training_data=self.training_data, fidelity_features=self.fidelity_features
+            training_data=self.training_data,
+            fidelity_features=self.search_space_digest.fidelity_features,
         )
         mock_GP.assert_called_with(train_X=self.Xs[0], train_Y=self.Ys[0])
         self.assertFalse(self.surrogate._constructed_manually)
@@ -136,13 +141,23 @@ class SurrogateTest(TestCase):
         # is `None`.
         surrogate.fit(
             training_data=self.training_data,
-            bounds=self.bounds,
-            task_features=self.task_features,
-            feature_names=self.feature_names,
+            search_space_digest=self.search_space_digest,
             metric_names=self.metric_names,
-            fidelity_features=self.fidelity_features,
-            target_fidelities=self.target_fidelities,
             refit=self.refit,
+        )
+        # Check that training data is correctly passed through to the
+        # BoTorch `Model`.
+        self.assertTrue(
+            torch.equal(
+                surrogate.model.train_inputs[0],
+                self.surrogate_kwargs.get("train_X"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                surrogate.model.train_targets,
+                self.surrogate_kwargs.get("train_Y").squeeze(1),
+            )
         )
         mock_state_dict.assert_not_called()
         mock_MLL.assert_called_once()
@@ -155,12 +170,8 @@ class SurrogateTest(TestCase):
         state_dict = {"state_attribute": "value"}
         surrogate.fit(
             training_data=self.training_data,
-            bounds=self.bounds,
-            task_features=self.task_features,
-            feature_names=self.feature_names,
+            search_space_digest=self.search_space_digest,
             metric_names=self.metric_names,
-            fidelity_features=self.fidelity_features,
-            target_fidelities=self.target_fidelities,
             refit=False,
             state_dict=state_dict,
         )
@@ -171,14 +182,16 @@ class SurrogateTest(TestCase):
     @patch(f"{SURROGATE_PATH}.predict_from_model")
     def test_predict(self, mock_predict):
         self.surrogate.construct(
-            training_data=self.training_data, fidelity_features=self.fidelity_features
+            training_data=self.training_data,
+            fidelity_features=self.search_space_digest.fidelity_features,
         )
         self.surrogate.predict(X=self.Xs[0])
         mock_predict.assert_called_with(model=self.surrogate.model, X=self.Xs[0])
 
     def test_best_in_sample_point(self):
         self.surrogate.construct(
-            training_data=self.training_data, fidelity_features=self.fidelity_features
+            training_data=self.training_data,
+            fidelity_features=self.search_space_digest.fidelity_features,
         )
         # `best_in_sample_point` requires `objective_weights`
         with patch(
@@ -186,13 +199,13 @@ class SurrogateTest(TestCase):
         ) as mock_best_in_sample:
             with self.assertRaisesRegex(ValueError, "Could not obtain"):
                 self.surrogate.best_in_sample_point(
-                    bounds=self.bounds, objective_weights=None
+                    search_space_digest=self.search_space_digest, objective_weights=None
                 )
         with patch(
             f"{SURROGATE_PATH}.best_in_sample_point", return_value=(self.Xs[0], 0.0)
         ) as mock_best_in_sample:
             best_point, observed_value = self.surrogate.best_in_sample_point(
-                bounds=self.bounds,
+                search_space_digest=self.search_space_digest,
                 objective_weights=self.objective_weights,
                 outcome_constraints=self.outcome_constraints,
                 linear_constraints=self.linear_constraints,
@@ -202,7 +215,7 @@ class SurrogateTest(TestCase):
             mock_best_in_sample.assert_called_with(
                 Xs=[self.training_data.X],
                 model=self.surrogate,
-                bounds=self.bounds,
+                bounds=self.search_space_digest.bounds,
                 objective_weights=self.objective_weights,
                 outcome_constraints=self.outcome_constraints,
                 linear_constraints=self.linear_constraints,
@@ -223,77 +236,97 @@ class SurrogateTest(TestCase):
         self, mock_best_point_util, mock_acqf_optimize, mock_acqf_init
     ):
         self.surrogate.construct(
-            training_data=self.training_data, fidelity_features=self.fidelity_features
+            training_data=self.training_data,
+            fidelity_features=self.search_space_digest.fidelity_features,
         )
         # currently cannot use function with fixed features
         with self.assertRaisesRegex(NotImplementedError, "Fixed features"):
             self.surrogate.best_out_of_sample_point(
-                bounds=self.bounds,
+                search_space_digest=self.search_space_digest,
                 objective_weights=self.objective_weights,
                 fixed_features=self.fixed_features,
             )
         candidate, acqf_value = self.surrogate.best_out_of_sample_point(
-            bounds=self.bounds,
+            search_space_digest=self.search_space_digest,
             objective_weights=self.objective_weights,
             outcome_constraints=self.outcome_constraints,
             linear_constraints=self.linear_constraints,
-            fidelity_features=self.fidelity_features,
-            target_fidelities=self.target_fidelities,
             options=self.options,
         )
         mock_acqf_init.assert_called_with(
             surrogate=self.surrogate,
             botorch_acqf_class=qSimpleRegret,
-            bounds=self.bounds,
+            search_space_digest=self.search_space_digest,
             objective_weights=self.objective_weights,
             outcome_constraints=self.outcome_constraints,
             linear_constraints=self.linear_constraints,
             fixed_features=None,
-            target_fidelities=self.target_fidelities,
             options={Keys.SAMPLER: SobolQMCNormalSampler},
         )
         self.assertTrue(torch.equal(candidate, torch.tensor([0.0])))
         self.assertTrue(torch.equal(acqf_value, torch.tensor([1.0])))
 
-    @patch(f"{SURROGATE_PATH}.Surrogate.fit")
-    def test_update(self, mock_fit):
+    @patch(f"{CURRENT_PATH}.SingleTaskGP.load_state_dict", return_value=None)
+    @patch(f"{CURRENT_PATH}.ExactMarginalLogLikelihood")
+    @patch(f"{SURROGATE_PATH}.fit_gpytorch_model")
+    def test_update(self, mock_fit_gpytorch, mock_MLL, mock_state_dict):
         self.surrogate.construct(
-            training_data=self.training_data, fidelity_features=self.fidelity_features
+            training_data=self.training_data,
+            fidelity_features=self.search_space_digest.fidelity_features,
         )
-        # Call `fit` by default
+        # Check that correct arguments are passed to `fit`.
+        with patch(f"{SURROGATE_PATH}.Surrogate.fit") as mock_fit:
+            # Call `fit` by default
+            self.surrogate.update(
+                training_data=self.training_data,
+                search_space_digest=self.search_space_digest,
+                metric_names=self.metric_names,
+                refit=self.refit,
+                state_dict={"key": "val"},
+            )
+            mock_fit.assert_called_with(
+                training_data=self.training_data,
+                search_space_digest=self.search_space_digest,
+                metric_names=self.metric_names,
+                candidate_metadata=None,
+                refit=self.refit,
+                state_dict={"key": "val"},
+            )
+
+        # Check that the training data is correctly passed through to the
+        # BoTorch `Model`.
+        Xs, Ys, Yvars, bounds, _, _, _ = get_torch_test_data(
+            dtype=self.dtype, offset=1.0
+        )
+        training_data = TrainingData(X=Xs[0], Y=Ys[0], Yvar=Yvars[0])
+        surrogate_kwargs = self.botorch_model_class.construct_inputs(training_data)
         self.surrogate.update(
-            training_data=self.training_data,
-            bounds=self.bounds,
-            task_features=self.task_features,
-            feature_names=self.feature_names,
+            training_data=training_data,
+            search_space_digest=self.search_space_digest,
             metric_names=self.metric_names,
-            fidelity_features=self.fidelity_features,
-            target_fidelities=self.target_fidelities,
             refit=self.refit,
             state_dict={"key": "val"},
         )
-        mock_fit.assert_called_with(
-            training_data=self.training_data,
-            bounds=self.bounds,
-            task_features=self.task_features,
-            feature_names=self.feature_names,
-            metric_names=self.metric_names,
-            fidelity_features=self.fidelity_features,
-            target_fidelities=self.target_fidelities,
-            candidate_metadata=None,
-            refit=self.refit,
-            state_dict={"key": "val"},
+        self.assertTrue(
+            torch.equal(
+                self.surrogate.model.train_inputs[0],
+                surrogate_kwargs.get("train_X"),
+            )
         )
-        # If should not be reconstructed, raise Error
+        self.assertTrue(
+            torch.equal(
+                self.surrogate.model.train_targets,
+                surrogate_kwargs.get("train_Y").squeeze(1),
+            )
+        )
+
+        # If should not be reconstructed, check that error is raised.
         self.surrogate._constructed_manually = True
         with self.assertRaisesRegex(NotImplementedError, ".* constructed manually"):
             self.surrogate.update(
                 training_data=self.training_data,
-                bounds=self.bounds,
-                task_features=self.task_features,
-                feature_names=self.feature_names,
+                search_space_digest=self.search_space_digest,
                 metric_names=self.metric_names,
-                fidelity_features=self.fidelity_features,
                 refit=self.refit,
             )
 

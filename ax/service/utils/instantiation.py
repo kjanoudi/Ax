@@ -8,9 +8,12 @@ import enum
 from typing import Dict, List, Optional, Union, cast
 
 import numpy as np
+from ax.core.abstract_data import AbstractDataFrameData
 from ax.core.arm import Arm
 from ax.core.data import Data
-from ax.core.experiment import Experiment
+from ax.core.experiment import DataType, Experiment
+from ax.core.map_data import MapData
+from ax.core.map_metric import MapMetric
 from ax.core.metric import Metric
 from ax.core.objective import Objective, MultiObjective
 from ax.core.optimization_config import (
@@ -34,12 +37,13 @@ from ax.core.simple_experiment import DEFAULT_OBJECTIVE_NAME
 from ax.core.types import (
     ComparisonOp,
     TEvaluationOutcome,
-    TFidelityTrialEvaluation,
+    TMapTrialEvaluation,
     TParameterization,
     TParamValue,
     TTrialEvaluation,
 )
 from ax.exceptions.core import UnsupportedError
+from ax.utils.common.constants import Keys
 from ax.utils.common.logger import get_logger
 from ax.utils.common.typeutils import (
     checked_cast,
@@ -70,6 +74,7 @@ EXPECTED_KEYS_IN_PARAM_REPR = {
     "is_fidelity",
     "is_ordered",
     "is_task",
+    "digits",
 }
 
 
@@ -119,8 +124,9 @@ def _make_range_param(
         lower=checked_cast_to_tuple((float, int), bounds[0]),
         upper=checked_cast_to_tuple((float, int), bounds[1]),
         log_scale=checked_cast(bool, representation.get("log_scale", False)),
+        digits=representation.get("digits", None),  # pyre-ignore[6]
         is_fidelity=checked_cast(bool, representation.get("is_fidelity", False)),
-        target_value=representation.get("target_value", None),  # pyre-ignore[6]
+        target_value=representation.get("target_value", None),
     )
 
 
@@ -469,12 +475,15 @@ def make_experiment(
     outcome_constraints: Optional[List[str]] = None,
     status_quo: Optional[TParameterization] = None,
     experiment_type: Optional[str] = None,
+    tracking_metric_names: Optional[List[str]] = None,
     # Single-objective optimization arguments:
     objective_name: Optional[str] = None,
     minimize: bool = False,
     # Multi-objective optimization arguments:
     objectives: Optional[Dict[str, str]] = None,
     objective_thresholds: Optional[List[str]] = None,
+    support_intermediate_data: Optional[bool] = False,
+    immutable_search_space_and_opt_config: Optional[bool] = True,
 ) -> Experiment:
     """Instantiation wrapper that allows for Ax `Experiment` creation
     without importing or instantiating any Ax classes.
@@ -496,8 +505,9 @@ def make_experiment(
             take; expects "float", "int", "bool" or "str"),
             3. "is_fidelity" (bool) and "target_value" (float) for fidelity
             parameters,
-            4. "is_ordered" (bool) for choice parameters, and
-            5. "is_task" (bool) for task parameters.
+            4. "is_ordered" (bool) for choice parameters,
+            5. "is_task" (bool) for task parameters, and
+            6. "digits" (int) for float-valued range parameters.
         name: Name of the experiment to be created.
         parameter_constraints: List of string representation of parameter
             constraints, such as "x3 >= x4" or "-x3 + 2*x4 - 3.5*x5 >= 2". For
@@ -514,6 +524,8 @@ def make_experiment(
             test configurations.
         experiment_type: String indicating type of the experiment (e.g. name of
             a product in which it is used), if any.
+        tracking_metric_names: Names of additional tracking metrics not used for
+            optimization.
         objective_name: Name of the metric used as objective in this experiment,
             if experiment is single-objective optimization.
         minimize: Whether this experiment represents a minimization problem, if
@@ -524,6 +536,13 @@ def make_experiment(
         objective_thresholds: A list of objective threshold constraints for multi-
             objective optimization, in the same string format as `outcome_constraints`
             argument.
+        support_intermediate_data: whether trials may report metrics results for
+            incomplete runs.
+        immutable_search_space_and_opt_config: Whether it's possible to update the
+            search space and optimization config on this experiment after creation.
+            Defaults to True. If set to True, we won't store or load copies of the
+            search space and optimization config on each generator run, which will
+            improve storage performance.
     """
     if objective_name is not None and (
         objectives is not None or objective_thresholds is not None
@@ -536,10 +555,12 @@ def make_experiment(
 
     status_quo_arm = None if status_quo is None else Arm(parameters=status_quo)
 
+    # TODO(jej): Needs to be decided per-metric when supporting heterogenous data.
+    metric_cls = MapMetric if support_intermediate_data else Metric
     if objectives is None:
         optimization_config = OptimizationConfig(
             objective=Objective(
-                metric=Metric(
+                metric=metric_cls(
                     name=objective_name or DEFAULT_OBJECTIVE_NAME,
                     lower_is_better=minimize,
                 ),
@@ -557,12 +578,32 @@ def make_experiment(
             status_quo_arm is not None,
         )
 
+    tracking_metrics = (
+        None
+        if tracking_metric_names is None
+        else [Metric(name=metric_name) for metric_name in tracking_metric_names]
+    )
+
+    default_data_type = (
+        DataType.MAP_DATA if support_intermediate_data else DataType.DATA
+    )
+
+    immutable_ss_and_oc = immutable_search_space_and_opt_config
+    properties = (
+        {}
+        if not immutable_search_space_and_opt_config
+        else {Keys.IMMUTABLE_SEARCH_SPACE_AND_OPT_CONF.value: immutable_ss_and_oc}
+    )
+
     return Experiment(
         name=name,
         search_space=make_search_space(parameters, parameter_constraints or []),
         optimization_config=optimization_config,
         status_quo=status_quo_arm,
         experiment_type=experiment_type,
+        tracking_metrics=tracking_metrics,
+        default_data_type=default_data_type,
+        properties=properties,
     )
 
 
@@ -574,7 +615,7 @@ def raw_data_to_evaluation(
 ) -> TEvaluationOutcome:
     """Format the trial evaluation data to a standard `TTrialEvaluation`
     (mapping from metric names to a tuple of mean and SEM) representation, or
-    to a TFidelityTrialEvaluation.
+    to a TMapTrialEvaluation.
 
     Note: this function expects raw_data to be data for a `Trial`, not a
     `BatchedTrial`.
@@ -614,7 +655,7 @@ def data_from_evaluations(
     sample_sizes: Dict[str, int],
     start_time: Optional[int] = None,
     end_time: Optional[int] = None,
-) -> Data:
+) -> AbstractDataFrameData:
     """Transforms evaluations into Ax Data.
 
     Each evaluation is either a trial evaluation: {metric_name -> (mean, SEM)}
@@ -641,13 +682,10 @@ def data_from_evaluations(
             end_time=end_time,
         )
     elif all(isinstance(evaluations[x], list) for x in evaluations.keys()):
-        # All evaluations are with-fidelity evaluations.
-        data = Data.from_fidelity_evaluations(
-            evaluations=cast(Dict[str, TFidelityTrialEvaluation], evaluations),
+        # All evaluations are map evaluations.
+        data = MapData.from_map_evaluations(
+            evaluations=cast(Dict[str, TMapTrialEvaluation], evaluations),
             trial_index=trial_index,
-            sample_sizes=sample_sizes,
-            start_time=start_time,
-            end_time=end_time,
         )
     else:
         raise ValueError(  # pragma: no cover

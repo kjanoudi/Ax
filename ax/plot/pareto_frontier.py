@@ -4,13 +4,14 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import plotly.graph_objs as go
 from ax.plot.base import CI_OPACITY, DECIMALS, AxPlotConfig, AxPlotTypes
-from ax.plot.helper import _format_CI, _format_dict
-from ax.plot.pareto_utils import COLORS, ParetoFrontierResults, rgba
+from ax.plot.color import COLORS, rgba
+from ax.plot.helper import extend_range, _format_CI, _format_dict
+from ax.plot.pareto_utils import ParetoFrontierResults
 from scipy.stats import norm
 
 
@@ -20,13 +21,152 @@ DEFAULT_CI_LEVEL: float = 0.9
 def _make_label(
     mean: float, sem: float, name: str, is_relative: bool, Z: Optional[float]
 ) -> str:
-    return "{name}: {estimate}{perc} {ci}<br>".format(
-        name=name,
-        estimate=round(mean, DECIMALS),
-        ci=""
-        if Z is None
-        else _format_CI(estimate=mean, sd=sem, relative=is_relative, zval=Z),
-        perc="%" if is_relative else "",
+    estimate = str(round(mean, DECIMALS))
+    perc = "%" if is_relative else ""
+    ci = (
+        ""
+        if (Z is None or np.isnan(sem))
+        else _format_CI(
+            estimate=mean, sd=sem, relative=is_relative, zval=Z  # pyre-ignore
+        )
+    )
+    return f"{name}: {estimate}{perc} {ci}<br>"
+
+
+def _filter_outliers(Y: np.ndarray, m: float = 2.0) -> np.ndarray:
+    std_filter = abs(Y - np.median(Y, axis=0)) < m * np.std(Y, axis=0)
+    return Y[np.all(abs(std_filter), axis=1)]
+
+
+def scatter_plot_with_pareto_frontier_plotly(
+    Y: np.ndarray,
+    Y_pareto: np.ndarray,
+    metric_x: str,
+    metric_y: str,
+    reference_point: Tuple[float, float],
+    minimize: bool = True,
+) -> go.Figure:
+    """Plots a scatter of all points in ``Y`` for ``metric_x`` and ``metric_y``
+    with a reference point and Pareto frontier from ``Y_pareto``.
+
+    Points in the scatter are colored in a gradient representing their trial index,
+    with metric_x on x-axis and metric_y on y-axis. Reference point is represented
+    as a star and Pareto frontier –– as a line. The frontier connects to the reference
+    point via projection lines.
+
+    NOTE: Both metrics should have the same minimization setting, passed as `minimize`.
+
+    Args:
+        Y: Array of outcomes, of which the first two will be plotted.
+        Y_pareto: Array of Pareto-optimal points, first two outcomes in which will be
+            plotted.
+        metric_x: Name of first outcome in ``Y``.
+        metric_Y: Name of second outcome in ``Y``.
+        reference_point: Reference point for ``metric_x`` and ``metric_y``.
+        minimize: Whether the two metrics in the plot are being minimized or maximized.
+    """
+    Xs = Y[:, 0]
+    Ys = Y[:, 1]
+
+    experimental_points_scatter = go.Scatter(
+        x=Xs,
+        y=Ys,
+        mode="markers",
+        marker={
+            "color": np.linspace(0, 100, int(len(Xs) * 1.05)),
+            "colorscale": "magma",
+            "colorbar": {
+                "tickvals": [0, 50, 100],
+                "ticktext": [
+                    1,
+                    "iteration",
+                    len(Xs),
+                ],
+            },
+        },
+        name="Experimental points",
+    )
+    reference_point_star = go.Scatter(
+        x=[reference_point[0]],
+        y=[reference_point[1]],
+        mode="markers",
+        marker={"color": rgba(COLORS.STEELBLUE.value), "size": 25, "symbol": "star"},
+    )
+    extra_point_x = min(Y_pareto[:, 0]) if minimize else max(Y_pareto[:, 0])
+    reference_point_line_1 = go.Scatter(
+        x=[extra_point_x, reference_point[0]],
+        y=[reference_point[1], reference_point[1]],
+        mode="lines",
+        marker={"color": rgba(COLORS.STEELBLUE.value)},
+    )
+    extra_point_y = min(Y_pareto[:, 1]) if minimize else max(Y_pareto[:, 1])
+    reference_point_line_2 = go.Scatter(
+        x=[reference_point[0], reference_point[0]],
+        y=[extra_point_y, reference_point[1]],
+        mode="lines",
+        marker={"color": rgba(COLORS.STEELBLUE.value)},
+    )
+    Y_pareto_with_extra = np.concatenate(
+        (
+            [[extra_point_x, reference_point[1]]],
+            Y_pareto,
+            [[reference_point[0], extra_point_y]],
+        ),
+        axis=0,
+    )
+    pareto_step = go.Scatter(
+        x=Y_pareto_with_extra[:, 0],
+        y=Y_pareto_with_extra[:, 1],
+        mode="lines",
+        marker={"color": rgba(COLORS.STEELBLUE.value)},
+    )
+
+    Y_no_outliers = _filter_outliers(Y=Y)
+    range_x = (
+        extend_range(lower=min(Y_no_outliers[:, 0]), upper=reference_point[0])
+        if minimize
+        else extend_range(lower=reference_point[0], upper=max(Y_no_outliers[:, 0]))
+    )
+    range_y = (
+        extend_range(lower=min(Y_no_outliers[:, 1]), upper=reference_point[1])
+        if minimize
+        else extend_range(lower=reference_point[1], upper=max(Y_no_outliers[:, 1]))
+    )
+    layout = go.Layout(
+        title="Observed points with Pareto frontier",
+        showlegend=False,
+        xaxis={"title": metric_x, "range": range_x},
+        yaxis={"title": metric_y, "range": range_y},
+    )
+    return go.Figure(
+        layout=layout,
+        data=[
+            pareto_step,
+            reference_point_line_1,
+            reference_point_line_2,
+            experimental_points_scatter,
+            reference_point_star,
+        ],
+    )
+
+
+def scatter_plot_with_pareto_frontier(
+    Y: np.ndarray,
+    Y_pareto: np.ndarray,
+    metric_x: str,
+    metric_y: str,
+    reference_point: Tuple[float, float],
+    minimize: bool = True,
+) -> AxPlotConfig:
+    return AxPlotConfig(
+        data=scatter_plot_with_pareto_frontier_plotly(
+            Y=Y,
+            Y_pareto=Y_pareto,
+            metric_x=metric_x,
+            metric_y=metric_y,
+            reference_point=reference_point,
+        ),
+        plot_type=AxPlotTypes.GENERIC,
     )
 
 
@@ -53,42 +193,50 @@ def plot_pareto_frontier(
     secondary_means = frontier.means[frontier.secondary_metric]
     secondary_sems = frontier.sems[frontier.secondary_metric]
     absolute_metrics = frontier.absolute_metrics
+    all_metrics = frontier.means.keys()
+    if frontier.arm_names is None:
+        arm_names = [f"Parameterization {i}" for i in range(len(frontier.param_dicts))]
+    else:
+        arm_names = [f"Arm {name}" for name in frontier.arm_names]
 
     if CI_level is not None:
         Z = 0.5 * norm.ppf(1 - (1 - CI_level) / 2)
     else:
         Z = None
 
+    primary_threshold = None
+    secondary_threshold = None
+    if frontier.objective_thresholds is not None:
+        primary_threshold = frontier.objective_thresholds.get(
+            frontier.primary_metric, None
+        )
+        secondary_threshold = frontier.objective_thresholds.get(
+            frontier.secondary_metric, None
+        )
+
     labels = []
     rel_x = frontier.secondary_metric not in absolute_metrics
     rel_y = frontier.primary_metric not in absolute_metrics
 
     for i, param_dict in enumerate(frontier.param_dicts):
-        heading = "<b>Parameterization {}</b><br>".format(i + 1)
-        x_lab = _make_label(
-            mean=secondary_means[i],
-            sem=secondary_sems[i],
-            name=frontier.secondary_metric,
-            is_relative=rel_x,
-            Z=Z,
-        )
-        y_lab = _make_label(
-            mean=primary_means[i],
-            sem=primary_sems[i],
-            name=frontier.primary_metric,
-            is_relative=rel_y,
-            Z=Z,
-        )
+        label = f"<b>{arm_names[i]}</b><br>"
+        for metric in all_metrics:
+            metric_lab = _make_label(
+                mean=frontier.means[metric][i],
+                sem=frontier.sems[metric][i],
+                name=metric,
+                is_relative=metric not in absolute_metrics,
+                Z=Z,
+            )
+            label += metric_lab
+
         parameterization = (
             _format_dict(param_dict, "Parameterization")
             if show_parameterization_on_hover
             else ""
         )
-        labels.append(
-            "{heading}<br>{xlab}{ylab}{param_blob}".format(
-                heading=heading, xlab=x_lab, ylab=y_lab, param_blob=parameterization
-            )
-        )
+        label += parameterization
+        labels.append(label)
 
     traces = [
         go.Scatter(
@@ -112,6 +260,34 @@ def plot_pareto_frontier(
         )
     ]
 
+    shapes = []
+    if primary_threshold is not None:
+        shapes.append(
+            {
+                "type": "line",
+                "xref": "paper",
+                "x0": 0.0,
+                "x1": 1.0,
+                "yref": "y",
+                "y0": primary_threshold,
+                "y1": primary_threshold,
+                "line": {"color": rgba(COLORS.CORAL.value), "width": 3},
+            }
+        )
+    if secondary_threshold is not None:
+        shapes.append(
+            {
+                "type": "line",
+                "yref": "paper",
+                "y0": 0.0,
+                "y1": 1.0,
+                "xref": "x",
+                "x0": secondary_threshold,
+                "x1": secondary_threshold,
+                "line": {"color": rgba(COLORS.CORAL.value), "width": 3},
+            }
+        )
+
     layout = go.Layout(
         title="Pareto Frontier",
         xaxis={
@@ -129,6 +305,7 @@ def plot_pareto_frontier(
         width=750,
         height=500,
         margin=go.layout.Margin(pad=4, l=225, b=75, t=75),  # noqa E741
+        shapes=shapes,
     )
 
     fig = go.Figure(data=traces, layout=layout)
@@ -144,14 +321,17 @@ def interact_pareto_frontier(
     if not frontier_list:
         raise ValueError("Must receive a non-empty list of pareto frontiers to plot.")
 
-    traces = [
-        plot_pareto_frontier(
+    traces = []
+    shapes = []
+    for frontier in frontier_list:
+        config = plot_pareto_frontier(
             frontier=frontier,
             CI_level=CI_level,
             show_parameterization_on_hover=show_parameterization_on_hover,
-        ).data["data"][0]
-        for frontier in frontier_list
-    ]
+        )
+        traces.append(config.data["data"][0])
+        shapes.append(config.data["layout"].get("shapes", []))
+
     for i, trace in enumerate(traces):
         if i == 0:  # Only the first trace is initially set to visible
             trace["visible"] = True
@@ -180,6 +360,7 @@ def interact_pareto_frontier(
                         "xaxis.title": secondary_metric,
                         "yaxis.ticksuffix": "%" if rel_y else "",
                         "xaxis.ticksuffix": "%" if rel_x else "",
+                        "shapes": shapes[i],
                     },
                 ],
                 "label": f"{primary_metric} vs {secondary_metric}",
@@ -219,6 +400,7 @@ def interact_pareto_frontier(
         width=750,
         height=500,
         margin=go.layout.Margin(pad=4, l=225, b=75, t=75),  # noqa E741
+        shapes=shapes[0],
     )
 
     fig = go.Figure(data=traces, layout=layout)

@@ -174,7 +174,6 @@ def get_and_fit_model(
         if isinstance(model, ModelListGP):
             mll = SumMarginalLogLikelihood(model.likelihood, model, mll_cls=mll_cls)
         else:
-            # pyre-ignore: [16]
             mll = mll_cls(model.likelihood, model)
         mll = fit_gpytorch_model(mll, bounds=bounds)
     return model
@@ -239,10 +238,9 @@ def _get_acqusition_func(
         raise ValueError("There are no feasible observed points.")
     # construct Objective module
     if kwargs.get("chebyshev_scalarization", False):
-        if "Ys" not in kwargs:
-            raise ValueError("Chebyshev Scalarization requires Ys argument")
-        Y_tensor = torch.cat(kwargs.get("Ys"), dim=-1)
-        obj_tf = get_chebyshev_scalarization(weights=objective_weights, Y=Y_tensor)
+        with torch.no_grad():
+            Y = model.posterior(X_observed).mean
+        obj_tf = get_chebyshev_scalarization(weights=objective_weights, Y=Y)
     else:
         obj_tf = get_objective_weights_transform(objective_weights)
 
@@ -318,9 +316,6 @@ def scipy_optimizer(
         sequential = False
     else:
         sequential = True
-        # use SLSQP by default for small problems since it yields faster wall times
-        if "method" not in kwargs:
-            kwargs["method"] = "SLSQP"
     X, expected_acquisition_value = optimize_acqf(
         acq_function=acq_function,
         bounds=bounds,
@@ -514,7 +509,7 @@ def _get_model(
     Returns:
         A GPyTorchModel (unfitted).
     """
-    Yvar = Yvar.clamp_min_(MIN_OBSERVED_NOISE_LEVEL)
+    Yvar = Yvar.clamp_min(MIN_OBSERVED_NOISE_LEVEL)  # pyre-ignore[16]
     is_nan = torch.isnan(Yvar)
     any_nan_Yvar = torch.any(is_nan)
     all_nan_Yvar = torch.all(is_nan)

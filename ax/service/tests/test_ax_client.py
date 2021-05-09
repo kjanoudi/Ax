@@ -206,6 +206,7 @@ class TestAxClient(TestCase):
                     "bounds": [0.001, 0.1],
                     "value_type": "float",
                     "log_scale": True,
+                    "digits": 6,
                 },
                 {
                     "name": "y",
@@ -238,6 +239,7 @@ class TestAxClient(TestCase):
             minimize=True,
             outcome_constraints=["some_metric >= 3", "some_metric <= 4.0"],
             parameter_constraints=["x4 <= x6"],
+            tracking_metric_names=["test_tracking_metric"],
         )
         assert ax_client._experiment is not None
         self.assertEqual(ax_client._experiment, ax_client.experiment)
@@ -249,6 +251,7 @@ class TestAxClient(TestCase):
                 lower=0.001,
                 upper=0.1,
                 log_scale=True,
+                digits=6,
             ),
         )
         self.assertEqual(
@@ -297,6 +300,11 @@ class TestAxClient(TestCase):
             ),
         )
         self.assertTrue(ax_client._experiment.optimization_config.objective.minimize)
+        self.assertDictEqual(
+            ax_client._experiment._tracking_metrics,
+            {"test_tracking_metric": Metric(name="test_tracking_metric")},
+        )
+        self.assertTrue(ax_client._experiment.immutable_search_space_and_opt_config)
 
     def test_constraint_same_as_objective(self):
         """Check that we do not allow constraints on the objective metric."""
@@ -331,7 +339,7 @@ class TestAxClient(TestCase):
         with self.assertRaisesRegex(ValueError, "Raw data has an invalid type"):
             ax_client.update_trial_data(trial_index, raw_data="invalid_data")
 
-    def test_raw_data_format_with_fidelities(self):
+    def test_raw_data_format_with_map_results(self):
         ax_client = AxClient()
         ax_client.create_experiment(
             parameters=[
@@ -339,6 +347,7 @@ class TestAxClient(TestCase):
                 {"name": "y", "type": "range", "bounds": [0.0, 1.0]},
             ],
             minimize=True,
+            support_intermediate_data=True,
         )
         for _ in range(6):
             parameterization, trial_index = ax_client.get_next_trial()
@@ -382,6 +391,52 @@ class TestAxClient(TestCase):
         for _ in range(10):
             parameterization, trial_index = ax_client.get_next_trial()
 
+    def test_update_running_trial_with_intermediate_data(self):
+        ax_client = AxClient()
+        ax_client.create_experiment(
+            parameters=[
+                {"name": "x", "type": "range", "bounds": [-5.0, 10.0]},
+                {"name": "y", "type": "range", "bounds": [0.0, 1.0]},
+            ],
+            minimize=True,
+            support_intermediate_data=True,
+        )
+        parameterization, trial_index = ax_client.get_next_trial()
+        # Launch Trial and update it 3 times with additional data.
+        for t in range(3):
+            x, y = parameterization.get("x"), parameterization.get("y")
+            if t < 2:
+                ax_client.update_running_trial_with_intermediate_data(
+                    0,
+                    raw_data=[({"t": t}, {"objective": (branin(x, y) + t, 0.0)})],
+                )
+            if t == 2:
+                ax_client.complete_trial(
+                    0,
+                    raw_data=[({"t": t}, {"objective": (branin(x, y) + t, 0.0)})],
+                )
+            current_data = ax_client.experiment.fetch_data().df
+            self.assertEqual(len(current_data), 0 if t < 2 else 3)
+
+        no_intermediate_data_ax_client = AxClient()
+        no_intermediate_data_ax_client.create_experiment(
+            parameters=[
+                {"name": "x", "type": "range", "bounds": [-5.0, 10.0]},
+                {"name": "y", "type": "range", "bounds": [0.0, 1.0]},
+            ],
+            minimize=True,
+            support_intermediate_data=False,
+        )
+        parameterization, trial_index = no_intermediate_data_ax_client.get_next_trial()
+        with self.assertRaises(ValueError):
+            no_intermediate_data_ax_client.update_running_trial_with_intermediate_data(
+                0,
+                raw_data=[
+                    ({"t": p_t}, {"objective": (branin(x, y) + t, 0.0)})
+                    for p_t in range(t + 1)
+                ],
+            )
+
     def test_trial_completion(self):
         ax_client = AxClient()
         ax_client.create_experiment(
@@ -411,7 +466,7 @@ class TestAxClient(TestCase):
             ax_client.update_trial_data(trial_index=idx, raw_data=1.0)
         ax_client.update_trial_data(trial_index=idx, raw_data={"m1": (1, 0.0)})
         metrics_in_data = ax_client.experiment.fetch_data().df["metric_name"].values
-        self.assertIn("m1", metrics_in_data)
+        self.assertNotIn("m1", metrics_in_data)
         self.assertIn("objective", metrics_in_data)
         self.assertEqual(ax_client.get_best_parameters()[0], params)
         params2, idy = ax_client.get_next_trial()
@@ -974,22 +1029,6 @@ class TestAxClient(TestCase):
                 parameterization={k: v + 1.0 for k, v in params.items()},
             )
         )
-
-    def test_tracking_metric_addition(self):
-        ax_client = AxClient()
-        ax_client.create_experiment(
-            name="test_experiment",
-            parameters=[
-                {"name": "x", "type": "range", "bounds": [-5.0, 10.0]},
-                {"name": "y", "type": "range", "bounds": [0.0, 15.0]},
-            ],
-            minimize=True,
-            objective_name="a",
-        )
-        params, trial_idx = ax_client.get_next_trial()
-        self.assertEqual(list(ax_client.experiment.metrics.keys()), ["a"])
-        ax_client.complete_trial(trial_index=trial_idx, raw_data={"a": 1.0, "b": 2.0})
-        self.assertEqual(list(ax_client.experiment.metrics.keys()), ["b", "a"])
 
     @patch(
         "ax.core.experiment.Experiment.new_trial",

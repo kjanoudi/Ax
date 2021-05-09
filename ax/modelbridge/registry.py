@@ -21,6 +21,7 @@ from ax.modelbridge.multi_objective_torch import MultiObjectiveTorchModelBridge
 from ax.modelbridge.random import RandomModelBridge
 from ax.modelbridge.torch import TorchModelBridge
 from ax.modelbridge.transforms.base import Transform
+from ax.modelbridge.transforms.choice_encode import OrderedChoiceEncode, ChoiceEncode
 from ax.modelbridge.transforms.convert_metric_names import ConvertMetricNames
 from ax.modelbridge.transforms.derelativize import Derelativize
 from ax.modelbridge.transforms.int_range_to_choice import IntRangeToChoice
@@ -28,7 +29,6 @@ from ax.modelbridge.transforms.int_to_float import IntToFloat
 from ax.modelbridge.transforms.ivw import IVW
 from ax.modelbridge.transforms.log import Log
 from ax.modelbridge.transforms.one_hot import OneHot
-from ax.modelbridge.transforms.ordered_choice_encode import OrderedChoiceEncode
 from ax.modelbridge.transforms.remove_fixed import RemoveFixed
 from ax.modelbridge.transforms.search_space_to_choice import SearchSpaceToChoice
 from ax.modelbridge.transforms.standardize_y import StandardizeY
@@ -81,6 +81,14 @@ Cont_X_trans: List[Type[Transform]] = [
 ]
 
 Discrete_X_trans: List[Type[Transform]] = [IntRangeToChoice]
+
+Mixed_transforms: List[Type[Transform]] = [
+    RemoveFixed,
+    ChoiceEncode,
+    IntToFloat,
+    Log,
+    UnitX,
+]
 
 Y_trans: List[Type[Transform]] = [IVW, Derelativize, StandardizeY]
 
@@ -192,6 +200,12 @@ MODEL_KEY_TO_MODEL_SETUP: Dict[str, ModelSetup] = {
     "MOO": ModelSetup(
         bridge_class=MultiObjectiveTorchModelBridge,
         model_class=MultiObjectiveBotorchModel,
+        transforms=Cont_X_trans + Y_trans,
+        standard_bridge_kwargs=STANDARD_TORCH_BRIDGE_KWARGS,
+    ),
+    "MOO_Modular": ModelSetup(
+        bridge_class=MultiObjectiveTorchModelBridge,
+        model_class=ModularBoTorchModel,
         transforms=Cont_X_trans + Y_trans,
         standard_bridge_kwargs=STANDARD_TORCH_BRIDGE_KWARGS,
     ),
@@ -360,6 +374,7 @@ class Models(ModelRegistryBase):
     EMPIRICAL_BAYES_THOMPSON = "EB"
     UNIFORM = "Uniform"
     MOO = "MOO"
+    MOO_MODULAR = "MOO_Modular"
 
 
 def get_model_from_generator_run(

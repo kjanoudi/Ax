@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import (
     TYPE_CHECKING,
@@ -14,8 +15,8 @@ from typing import (
     Dict,
     List,
     MutableMapping,
-    NamedTuple,
     Optional,
+    Set,
     Union,
 )
 
@@ -25,6 +26,7 @@ from ax.core.base_trial import BaseTrial
 from ax.core.generator_run import GeneratorRun, GeneratorRunType
 from ax.core.trial import immutable_once_run
 from ax.core.types import TCandidateMetadata
+from ax.utils.common.base import SortableBase
 from ax.utils.common.docutils import copy_doc
 from ax.utils.common.equality import datetime_equals, equality_typechecker
 from ax.utils.common.logger import get_logger
@@ -39,8 +41,9 @@ if TYPE_CHECKING:
     from ax import core  # noqa F401  # pragma: no cover
 
 
-class AbandonedArm(NamedTuple):
-    """Tuple storing metadata of arm that has been abandoned within
+@dataclass
+class AbandonedArm(SortableBase):
+    """Class storing metadata of arm that has been abandoned within
     a BatchTrial.
     """
 
@@ -56,12 +59,21 @@ class AbandonedArm(NamedTuple):
             and datetime_equals(self.time, other.time)
         )
 
+    @property
+    def _unique_id(self) -> str:
+        return self.name
 
-class GeneratorRunStruct(NamedTuple):
+
+@dataclass
+class GeneratorRunStruct(SortableBase):
     """Stores GeneratorRun object as well as the weight with which it was added."""
 
     generator_run: GeneratorRun
     weight: float
+
+    @property
+    def _unique_id(self) -> str:
+        return self.generator_run._unique_id + ":" + str(self.weight)
 
 
 class BatchTrial(BaseTrial):
@@ -116,6 +128,7 @@ class BatchTrial(BaseTrial):
             ttl_seconds=ttl_seconds,
             index=index,
         )
+        self._arms_by_name: Dict[str, Arm] = {}
         self._generator_run_structs: List[GeneratorRunStruct] = []
         self._abandoned_arms_metadata: Dict[str, AbandonedArm] = {}
         self._status_quo: Optional[Arm] = None
@@ -135,6 +148,12 @@ class BatchTrial(BaseTrial):
             # Set the status quo for tracking purposes
             # It will not be included in arm_weights
             self._status_quo = status_quo
+
+        # Trial status quos are stored in the DB as a generator run
+        # with one arm; thus we need to store two `db_id` values
+        # for this object instead of one
+        self._status_quo_generator_run_db_id: Optional[int] = None
+        self._status_quo_arm_db_id: Optional[int] = None
 
     @property
     def experiment(self) -> core.experiment.Experiment:
@@ -240,9 +259,6 @@ class BatchTrial(BaseTrial):
         Returns:
             The trial instance.
         """
-        # Copy the generator run, to preserve initial and skip mutations to arms.
-        generator_run = generator_run.clone()
-
         # First validate generator run arms
         for arm in generator_run.arms:
             self.experiment.search_space.check_types(arm.parameters, raise_error=True)
@@ -264,6 +280,7 @@ class BatchTrial(BaseTrial):
         self._set_generation_step_index(
             generation_step_index=generator_run._generation_step_index
         )
+        self._refresh_arms_by_name()
         return self
 
     @property
@@ -282,6 +299,7 @@ class BatchTrial(BaseTrial):
     def unset_status_quo(self) -> None:
         """Set the status quo to None."""
         self._status_quo = None
+        self._refresh_arms_by_name()
 
     @immutable_once_run
     def set_status_quo_with_weight(self, status_quo: Arm, weight: float) -> BatchTrial:
@@ -301,8 +319,9 @@ class BatchTrial(BaseTrial):
             self.experiment._name_and_store_arm_if_not_exists(
                 arm=status_quo, proposed_name="status_quo_" + str(self.index)
             )
-        self._status_quo = status_quo
+        self._status_quo = status_quo.clone()
         self._status_quo_weight_override = weight
+        self._refresh_arms_by_name()
         return self
 
     @immutable_once_run
@@ -356,22 +375,29 @@ class BatchTrial(BaseTrial):
     @property
     def arms_by_name(self) -> Dict[str, Arm]:
         """Map from arm name to object for all arms in trial."""
-        arms_by_name = {}
+        return self._arms_by_name
+
+    def _refresh_arms_by_name(self) -> None:
+        self._arms_by_name = {}
         for arm in self.arms:
             if not arm.has_name:
                 raise ValueError(  # pragma: no cover
                     "Arms attached to a trial must have a name."
                 )
-            arms_by_name[arm.name] = arm
-        return arms_by_name
+            self._arms_by_name[arm.name] = arm
 
     @property
     def abandoned_arms(self) -> List[Arm]:
-        """List of arms that have been abandoned within this trial"""
+        """List of arms that have been abandoned within this trial."""
         return [
             self.arms_by_name[arm.name]
             for arm in self._abandoned_arms_metadata.values()
         ]
+
+    @property
+    def abandoned_arm_names(self) -> Set[str]:
+        """Set of names of arms that have been abandoned within this trial."""
+        return set(self._abandoned_arms_metadata.keys())
 
     # pyre-ignore[6]: T77111662.
     @copy_doc(BaseTrial.generator_runs)
@@ -452,6 +478,12 @@ class BatchTrial(BaseTrial):
 
         Usually done after deployment when one arm causes issues but
         user wants to continue running other arms in the batch.
+
+        NOTE: Abandoned arms are considered to be 'pending points' in
+        experiment after their abandonment to avoid Ax models suggesting
+        the same arm again as a new candidate. Abandoned arms are also
+        excluded from model training data unless ``fit_abandoned``
+        option is specified to model bridge.
 
         Args:
             arm_name: The name of the arm to abandon.

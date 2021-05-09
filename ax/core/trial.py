@@ -91,7 +91,7 @@ class Trial(BaseTrial):
         return generator_run.arms[0]
 
     @immutable_once_run
-    def add_arm(self, arm: Arm) -> "Trial":
+    def add_arm(self, arm: Arm) -> Trial:
         """Add arm to the trial.
 
         Returns:
@@ -105,7 +105,7 @@ class Trial(BaseTrial):
     @immutable_once_run
     def add_generator_run(
         self, generator_run: GeneratorRun, multiplier: float = 1.0
-    ) -> "Trial":
+    ) -> Trial:
         """Add a generator run to the trial.
 
         Note: since trial includes only one arm, this will raise a ValueError if
@@ -114,7 +114,6 @@ class Trial(BaseTrial):
         Returns:
             The trial instance.
         """
-
         if len(generator_run.arms) > 1:
             raise ValueError(
                 "Trial includes only one arm, but this generator run "
@@ -229,7 +228,9 @@ class Trial(BaseTrial):
 
         gr = self.generator_run
         if gr is None or gr.arms[0].name != arm_name:
-            raise ValueError(f"Arm by name {arm_name} is not part of this trial.")
+            raise ValueError(
+                f"Arm by name {arm_name} is not part of trial #{self.index}."
+            )
 
         if gr.candidate_metadata_by_arm_signature is None:
             return None

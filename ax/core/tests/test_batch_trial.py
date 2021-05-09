@@ -11,6 +11,7 @@ from unittest.mock import PropertyMock, patch
 import numpy as np
 from ax.core.arm import Arm
 from ax.core.base_trial import TrialStatus
+from ax.core.batch_trial import GeneratorRunStruct
 from ax.core.experiment import Experiment
 from ax.core.generator_run import GeneratorRun, GeneratorRunType
 from ax.core.parameter import FixedParameter, ParameterType
@@ -55,8 +56,6 @@ class BatchTrialTest(TestCase):
         self.assertEqual(self.batch.index, 0)
         self.assertEqual(self.batch.status, TrialStatus.CANDIDATE)
         self.assertIsNotNone(self.batch.time_created)
-        self.assertEqual(self.batch.arms_by_name["0_0"], self.batch.arms[0])
-        self.assertEqual(self.batch.arms_by_name["0_1"], self.batch.arms[1])
         self.assertEqual(
             self.batch.generator_run_structs[0].generator_run.generator_run_type,
             GeneratorRunType.MANUAL.name,
@@ -206,6 +205,33 @@ class BatchTrialTest(TestCase):
             math.isclose(
                 batch.arm_weights[batch.status_quo], expected_status_quo_weight
             )
+        )
+
+    def testArmsByName(self):
+        # Initializes empty
+        newbatch = self.experiment.new_batch_trial()
+        self.assertEqual(newbatch.arms_by_name, {})
+
+        # Correct when arms have been added
+        self.assertEqual(self.batch.arms_by_name["0_0"], self.batch.arms[0])
+        self.assertEqual(self.batch.arms_by_name["0_1"], self.batch.arms[1])
+
+        # Refreshed when arm is added
+        newbatch.add_arm(self.batch.arms[0])
+        self.assertEqual(newbatch.arms_by_name, {"0_0": self.batch.arms[0]})
+
+        # Refreshed when status quo is set
+        newbatch.set_status_quo_with_weight(self.batch.arms[1], 1.0)
+        self.assertEqual(
+            newbatch.arms_by_name,
+            {"0_0": self.batch.arms[0], "0_1": self.batch.arms[1]},
+        )
+
+        # Refreshed when status quo is unset
+        newbatch.unset_status_quo()
+        self.assertEqual(
+            newbatch.arms_by_name,
+            {"0_0": self.batch.arms[0]},
         )
 
     def testBatchLifecycle(self):
@@ -584,3 +610,21 @@ class BatchTrialTest(TestCase):
                 cand_metadata_expected[arm.name],
                 self.batch._get_candidate_metadata(arm.name),
             )
+
+    def testSortable(self):
+        new_batch_trial = self.experiment.new_batch_trial()
+        self.assertTrue(self.batch < new_batch_trial)
+
+        abandoned_arm = get_abandoned_arm()
+        abandoned_arm_2 = get_abandoned_arm()
+        abandoned_arm_2.name = "0_1"
+        self.assertTrue(abandoned_arm < abandoned_arm_2)
+
+        generator_run = get_generator_run()
+        generator_run_struct = GeneratorRunStruct(
+            generator_run=generator_run, weight=1.0
+        )
+        generator_run_struct_2 = GeneratorRunStruct(
+            generator_run=generator_run, weight=2.0
+        )
+        self.assertTrue(generator_run_struct < generator_run_struct_2)

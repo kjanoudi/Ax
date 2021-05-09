@@ -11,6 +11,15 @@ ax.core
 Core Classes
 -------------
 
+`AbstractData`
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. automodule:: ax.core.abstract_data
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :noindex:
+
 `Arm`
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -59,6 +68,24 @@ Core Classes
     :members:
     :undoc-members:
     :show-inheritance:
+
+`MapData`
+~~~~~~~~~~~~~~
+
+.. automodule:: ax.core.map_data
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :noindex:
+
+`MapMetric`
+~~~~~~~~~~~~~~
+
+.. automodule:: ax.core.map_metric
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :noindex:
 
 `Metric`
 ~~~~~~~~~~~~~~
@@ -142,6 +169,7 @@ Objective
     :members:
     :undoc-members:
     :show-inheritance:
+    :noindex:
 
 `SimpleExperiment`
 ~~~~~~~~~~~~~~~~~~~

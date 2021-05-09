@@ -13,8 +13,10 @@ from ax.core.arm import Arm
 from ax.core.base_trial import TrialStatus
 from ax.core.batch_trial import AbandonedArm, BatchTrial, GeneratorRunStruct
 from ax.core.data import Data
-from ax.core.experiment import Experiment
+from ax.core.experiment import DataType, Experiment
 from ax.core.generator_run import GeneratorRun
+from ax.core.map_data import MapData
+from ax.core.map_metric import MapMetric
 from ax.core.metric import Metric
 from ax.core.multi_type_experiment import MultiTypeExperiment
 from ax.core.objective import MultiObjective, Objective, ScalarizedObjective
@@ -39,10 +41,12 @@ from ax.core.simple_experiment import SimpleExperiment
 from ax.core.trial import Trial
 from ax.core.types import ComparisonOp
 from ax.metrics.branin import AugmentedBraninMetric, BraninMetric, NegativeBraninMetric
+from ax.metrics.chemistry import ChemistryProblemType, ChemistryMetric
 from ax.metrics.factorial import FactorialMetric
 from ax.metrics.hartmann6 import AugmentedHartmann6Metric, Hartmann6Metric
 from ax.metrics.l2norm import L2NormMetric
 from ax.metrics.noisy_function import NoisyFunctionMetric
+from ax.metrics.sklearn import SklearnMetric, SklearnDataset, SklearnModelType
 from ax.modelbridge.factory import Models
 from ax.modelbridge.generation_strategy import GenerationStep, GenerationStrategy
 from ax.modelbridge.transforms.base import Transform
@@ -65,6 +69,7 @@ from ax.storage.json_store.encoders import (
     generation_step_to_dict,
     generation_strategy_to_dict,
     generator_run_to_dict,
+    map_data_to_dict,
     metric_to_dict,
     multi_objective_optimization_config_to_dict,
     multi_objective_to_dict,
@@ -110,10 +115,14 @@ ENCODER_REGISTRY: Dict[Type, Callable[[Any], Dict[str, Any]]] = {
     Hartmann6Metric: metric_to_dict,
     ListSurrogate: surrogate_to_dict,
     L2NormMetric: metric_to_dict,
+    MapData: map_data_to_dict,
+    MapMetric: metric_to_dict,
     Metric: metric_to_dict,
     MultiObjective: multi_objective_to_dict,
     MultiObjectiveOptimizationConfig: multi_objective_optimization_config_to_dict,
     MultiTypeExperiment: multi_type_experiment_to_dict,
+    SklearnMetric: metric_to_dict,
+    ChemistryMetric: metric_to_dict,
     NegativeBraninMetric: metric_to_dict,
     NoisyFunctionMetric: metric_to_dict,
     Objective: objective_to_dict,
@@ -156,9 +165,12 @@ DECODER_REGISTRY: Dict[str, Type] = {
     "BenchmarkResult": BenchmarkResult,
     "BoTorchModel": BoTorchModel,
     "BraninMetric": BraninMetric,
+    "ChemistryMetric": ChemistryMetric,
+    "ChemistryProblemType": ChemistryProblemType,
     "ChoiceParameter": ChoiceParameter,
     "ComparisonOp": ComparisonOp,
     "Data": Data,
+    "DataType": DataType,
     "DomainType": DomainType,
     "Experiment": Experiment,
     "FactorialMetric": FactorialMetric,
@@ -170,6 +182,8 @@ DECODER_REGISTRY: Dict[str, Type] = {
     "Hartmann6Metric": Hartmann6Metric,
     "ListSurrogate": ListSurrogate,
     "L2NormMetric": L2NormMetric,
+    "MapData": MapData,
+    "MapMetric": MapMetric,
     "Metric": Metric,
     "Models": Models,
     "MultiObjective": MultiObjective,
@@ -190,6 +204,9 @@ DECODER_REGISTRY: Dict[str, Type] = {
     "SearchSpace": SearchSpace,
     "SimpleBenchmarkProblem": SimpleBenchmarkProblem,
     "SimpleExperiment": SimpleExperiment,
+    "SklearnDataset": SklearnDataset,
+    "SklearnMetric": SklearnMetric,
+    "SklearnModelType": SklearnModelType,
     "SumConstraint": SumConstraint,
     "Surrogate": Surrogate,
     "SyntheticRunner": SyntheticRunner,

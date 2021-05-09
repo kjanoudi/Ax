@@ -6,9 +6,10 @@
 
 from collections import OrderedDict, defaultdict
 from enum import Enum
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Type, Union
 
 import pandas as pd
+from ax.core.abstract_data import AbstractDataFrameData
 from ax.core.arm import Arm
 from ax.core.base_trial import BaseTrial, TrialStatus
 from ax.core.batch_trial import AbandonedArm, BatchTrial, GeneratorRunStruct
@@ -130,6 +131,7 @@ class Decoder:
         # Remove 'subclass' from experiment's properties, since its only
         # used for decoding to the correct experiment subclass in storage.
         subclass = properties.pop(Keys.SUBCLASS, None)
+        default_data_type = experiment_sqa.default_data_type
         if subclass == "SimpleExperiment":
             if opt_config is None:
                 raise SQADecodeError(  # pragma: no cover
@@ -143,6 +145,7 @@ class Decoder:
                 outcome_constraints=opt_config.outcome_constraints,
                 status_quo=status_quo,
                 properties=properties,
+                default_data_type=default_data_type,
             )
             experiment.description = experiment_sqa.description
             experiment.is_test = experiment_sqa.is_test
@@ -157,6 +160,7 @@ class Decoder:
                 status_quo=status_quo,
                 is_test=experiment_sqa.is_test,
                 properties=properties,
+                default_data_type=default_data_type,
             )
         return experiment
 
@@ -191,11 +195,12 @@ class Decoder:
             for sqa_runner in experiment_sqa.runners
         }
         default_trial_type = not_none(experiment_sqa.default_trial_type)
-        properties = experiment_sqa.properties
+        properties = dict(experiment_sqa.properties or {})
         if properties:
             # Remove 'subclass' from experiment's properties, since its only
             # used for decoding to the correct experiment subclass in storage.
             properties.pop(Keys.SUBCLASS, None)
+        default_data_type = experiment_sqa.default_data_type
         experiment = MultiTypeExperiment(
             name=experiment_sqa.name,
             description=experiment_sqa.description,
@@ -205,6 +210,7 @@ class Decoder:
             optimization_config=opt_config,
             status_quo=status_quo,
             properties=properties,
+            default_data_type=default_data_type,
         )
         experiment._trial_type_to_runner = trial_type_to_runner
         sqa_metric_dict = {metric.name: metric for metric in experiment_sqa.metrics}
@@ -244,8 +250,10 @@ class Decoder:
         for data_sqa in experiment_sqa.data:
             trial_index = data_sqa.trial_index
             timestamp = data_sqa.time_created
+            # TODO: Use metrics-like Data type field in Data instead.
+            default_data_constructor = experiment.default_data_constructor
             data_by_trial[trial_index][timestamp] = self.data_from_sqa(
-                data_sqa=data_sqa
+                data_sqa=data_sqa, data_constructor=default_data_constructor
             )
         data_by_trial = {
             trial_index: OrderedDict(sorted(data_by_timestamp.items()))
@@ -303,6 +311,8 @@ class Decoder:
                 values=parameter_sqa.choice_values,
                 is_fidelity=parameter_sqa.is_fidelity or False,
                 target_value=parameter_sqa.target_value,
+                is_ordered=parameter_sqa.is_ordered,
+                is_task=parameter_sqa.is_task,
             )
         elif parameter_sqa.domain_type == DomainType.FIXED:
             # Don't throw an error if parameter_sqa.fixed_value is None;
@@ -419,7 +429,7 @@ class Decoder:
                 f"Cannot decode SQAMetric because {metric_sqa.metric_type} "
                 f"is an invalid type."
             )
-        args = metric_sqa.properties or {}
+        args = dict(metric_sqa.properties or {})
         args["name"] = metric_sqa.name
         args["lower_is_better"] = metric_sqa.lower_is_better
         args = metric_class.deserialize_init_args(args=args)
@@ -468,11 +478,13 @@ class Decoder:
                 self.metric_from_sqa_util(child) for child in metrics_sqa_children
             ]
 
-            return MultiObjective(
+            multi_objective = MultiObjective(
                 metrics=list(metrics),
                 # pyre-fixme[6]: Expected `bool` for 2nd param but got `Optional[bool]`.
                 minimize=metric_sqa.minimize,
             )
+            multi_objective.db_id = metric_sqa.id
+            return multi_objective
         elif (
             metric_sqa.intent == MetricIntent.SCALARIZED_OBJECTIVE
         ):  # metric_sqa is a parent whose children are individual
@@ -499,12 +511,14 @@ class Decoder:
                     for child in metrics_sqa_children
                 ]
             )
-            return ScalarizedObjective(
+            scalarized_objective = ScalarizedObjective(
                 metrics=list(metrics),
                 weights=list(weights),
                 # pyre-fixme[6]: Expected `bool` for 3nd param but got `Optional[bool]`.
                 minimize=metric_sqa.minimize,
             )
+            scalarized_objective.db_id = metric_sqa.id
+            return scalarized_objective
         elif metric_sqa.intent == MetricIntent.OUTCOME_CONSTRAINT:
             if (
                 metric_sqa.bound is None
@@ -552,7 +566,7 @@ class Decoder:
                     for child in metrics_sqa_children
                 ]
             )
-            return ScalarizedOutcomeConstraint(
+            scalarized_outcome_constraint = ScalarizedOutcomeConstraint(
                 metrics=list(metrics),
                 weights=list(weights),
                 # pyre-fixme[6]: Expected `float` for 2nd param but got
@@ -561,7 +575,8 @@ class Decoder:
                 op=metric_sqa.op,
                 relative=metric_sqa.relative,
             )
-
+            scalarized_outcome_constraint.db_id = metric_sqa.id
+            return scalarized_outcome_constraint
         elif metric_sqa.intent == MetricIntent.OBJECTIVE_THRESHOLD:
             if metric_sqa.bound is None or metric_sqa.relative is None:
                 raise SQADecodeError(  # pragma: no cover
@@ -628,21 +643,29 @@ class Decoder:
         self, abandoned_arm_sqa: SQAAbandonedArm
     ) -> AbandonedArm:
         """Convert SQLAlchemy AbandonedArm to Ax AbandonedArm."""
-        return AbandonedArm(
+        arm = AbandonedArm(
             name=abandoned_arm_sqa.name,
             reason=abandoned_arm_sqa.abandoned_reason,
             time=abandoned_arm_sqa.time_abandoned,
         )
+        arm.db_id = abandoned_arm_sqa.id
+        return arm
 
     def generator_run_from_sqa(
-        self, generator_run_sqa: SQAGeneratorRun, reduced_state: bool = False
+        self,
+        generator_run_sqa: SQAGeneratorRun,
+        reduced_state: bool,
+        immutable_search_space_and_opt_config: bool,
     ) -> GeneratorRun:
         """Convert SQLAlchemy GeneratorRun to Ax GeneratorRun.
 
         Args:
             generator_run_sqa: `SQAGeneratorRun` to decode.
             reduced_state: Whether to load generator runs with a slightly reduced state
-            (without model state, search space, and optimization config).
+                (without model state, search space, and optimization config).
+            immutable_search_space_and_opt_config: Whether to load generator runs
+                without search space and optimization config. Unlike `reduced_state`,
+                we do still load model state.
         """
         arms = []
         weights = []
@@ -653,7 +676,7 @@ class Decoder:
             arms.append(self.arm_from_sqa(arm_sqa=arm_sqa))
             weights.append(arm_sqa.weight)
 
-        if not reduced_state:
+        if not reduced_state and not immutable_search_space_and_opt_config:
             (
                 opt_config,
                 tracking_metrics,
@@ -736,21 +759,37 @@ class Decoder:
         steps = object_from_json(gs_sqa.steps)
         gs = GenerationStrategy(name=gs_sqa.name, steps=steps)
         gs._curr = gs._steps[gs_sqa.curr_index]
+        immutable_ss_and_oc = (
+            experiment.immutable_search_space_and_opt_config
+            if experiment is not None
+            else False
+        )
         if reduced_state and gs_sqa.generator_runs:
             # Only fully load the last of the generator runs, load the rest with
             # reduced state.
             gs._generator_runs = [
-                self.generator_run_from_sqa(generator_run_sqa=gr, reduced_state=True)
+                self.generator_run_from_sqa(
+                    generator_run_sqa=gr,
+                    reduced_state=True,
+                    immutable_search_space_and_opt_config=immutable_ss_and_oc,
+                )
                 for gr in gs_sqa.generator_runs[:-1]
             ]
             gs._generator_runs.append(
                 self.generator_run_from_sqa(
-                    generator_run_sqa=gs_sqa.generator_runs[-1], reduced_state=False
+                    generator_run_sqa=gs_sqa.generator_runs[-1],
+                    reduced_state=False,
+                    immutable_search_space_and_opt_config=immutable_ss_and_oc,
                 )
             )
         else:
             gs._generator_runs = [
-                self.generator_run_from_sqa(gr) for gr in gs_sqa.generator_runs
+                self.generator_run_from_sqa(
+                    generator_run_sqa=gr,
+                    reduced_state=False,
+                    immutable_search_space_and_opt_config=immutable_ss_and_oc,
+                )
+                for gr in gs_sqa.generator_runs
             ]
         if len(gs._generator_runs) > 0:
             # Generation strategy had an initialized model.
@@ -781,7 +820,9 @@ class Decoder:
                 f"Cannot decode SQARunner because {runner_sqa.runner_type} "
                 f"is an invalid type."
             )
-        args = runner_class.deserialize_init_args(args=runner_sqa.properties or {})
+        args = runner_class.deserialize_init_args(
+            args=dict(runner_sqa.properties or {})
+        )
         # pyre-ignore[45]: Cannot instantiate abstract class `Runner`.
         runner = runner_class(**args)
         runner.db_id = runner_sqa.id
@@ -798,6 +839,7 @@ class Decoder:
             reduced state (without model state, search space, and optimization config).
 
         """
+        immutable_ss_and_oc = experiment.immutable_search_space_and_opt_config
         if trial_sqa.is_batch:
             trial = BatchTrial(
                 experiment=experiment,
@@ -810,6 +852,7 @@ class Decoder:
                     generator_run=self.generator_run_from_sqa(
                         generator_run_sqa=generator_run_sqa,
                         reduced_state=reduced_state,
+                        immutable_search_space_and_opt_config=immutable_ss_and_oc,
                     ),
                     weight=generator_run_sqa.weight or 1.0,
                 )
@@ -825,6 +868,10 @@ class Decoder:
                         status_quo_weight = struct.generator_run.weights[0]
                         trial._status_quo = struct.generator_run.arms[0]
                         trial._status_quo_weight_override = status_quo_weight
+                        trial._status_quo_generator_run_db_id = (
+                            struct.generator_run.db_id
+                        )
+                        trial._status_quo_arm_db_id = struct.generator_run.arms[0].db_id
                     else:
                         new_generator_run_structs.append(struct)
                 generator_run_structs = new_generator_run_structs
@@ -836,6 +883,7 @@ class Decoder:
                     )
                     for abandoned_arm_sqa in trial_sqa.abandoned_arms
                 }
+            trial._refresh_arms_by_name()  # Trigger cache build
         else:
             trial = Trial(
                 experiment=experiment,
@@ -851,6 +899,7 @@ class Decoder:
                 trial._generator_run = self.generator_run_from_sqa(
                     generator_run_sqa=trial_sqa.generator_runs[0],
                     reduced_state=reduced_state,
+                    immutable_search_space_and_opt_config=immutable_ss_and_oc,
                 )
         trial._trial_type = trial_sqa.trial_type
         # Swap `DISPATCHED` for `RUNNING`, since `DISPATCHED` is deprecated and nearly
@@ -881,13 +930,20 @@ class Decoder:
             self.runner_from_sqa(trial_sqa.runner) if trial_sqa.runner else None
         )
         trial._generation_step_index = trial_sqa.generation_step_index
-        trial._properties = trial_sqa.properties or {}
+        trial._properties = dict(trial_sqa.properties or {})
         trial.db_id = trial_sqa.id
         return trial
 
-    def data_from_sqa(self, data_sqa: SQAData) -> Data:
+    def data_from_sqa(
+        self,
+        data_sqa: SQAData,
+        data_constructor: Optional[Type[AbstractDataFrameData]] = None,
+    ) -> AbstractDataFrameData:
         """Convert SQLAlchemy Data to AE Data."""
-        dat = Data(
+        # TODO: extract data type from SQAData after DataRegistry added.
+        data_constructor = data_constructor or Data
+        # pyre-ignore[45]: Cannot instantiate abstract class. But this is concrete.
+        dat = data_constructor(
             description=data_sqa.description,
             # NOTE: Need dtype=False, otherwise infers arm_names like
             # "4_1" should be int 41.
