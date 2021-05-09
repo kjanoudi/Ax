@@ -914,7 +914,8 @@ class AxClient(WithDBSettingsBase):
             trial=trial, raw_data=raw_data, metadata=metadata, sample_sizes=sample_sizes
         )
         metadata = metadata or {}
-        self._validate_trial_data(trial=trial, data=data)
+        # TODO: Removed this to prevent all the info logs
+        # self._validate_trial_data(trial=trial, data=data)
         trial.update_run_metadata(metadata=metadata)
 
         self.experiment.attach_data(
@@ -1158,16 +1159,16 @@ class AxClient(WithDBSettingsBase):
 
     def _validate_trial_data(self, trial: Trial, data: AbstractDataFrameData) -> None:
         for metric_name in data.df["metric_name"].values:
-            # if metric_name not in self.experiment.metrics:
-                # logger.info(
-                #     f"Data was logged for metric {metric_name} that was not yet "
-                #     "tracked on the experiment. Please specify `tracking_metric_"
-                #     "names` argument in AxClient.create_experiment to add tracking "
-                #     "metrics to the experiment. Without those, all data users "
-                #     "specify is still attached to the experiment, but will not be "
-                #     "fetched in `experiment.fetch_data()`, but you can still use "
-                #     "`experiment.lookup_data_for_trial` to get all attached data."
-                # )
+            if metric_name not in self.experiment.metrics:
+                logger.info(
+                    f"Data was logged for metric {metric_name} that was not yet "
+                    "tracked on the experiment. Please specify `tracking_metric_"
+                    "names` argument in AxClient.create_experiment to add tracking "
+                    "metrics to the experiment. Without those, all data users "
+                    "specify is still attached to the experiment, but will not be "
+                    "fetched in `experiment.fetch_data()`, but you can still use "
+                    "`experiment.lookup_data_for_trial` to get all attached data."
+                )
 
     # -------- Backward-compatibility with old save / load method names. -------
 
