@@ -891,6 +891,12 @@ class AxClient(WithDBSettingsBase):
         opt_config = not_none(self.experiment.optimization_config)
         return opt_config.objective.metric.name
 
+    @property
+    def objective(self) -> str:
+        """Returns the name of the objective in this optimization."""
+        opt_config = not_none(self.experiment.optimization_config)
+        return opt_config.objective
+
     def _update_trial_with_raw_data(
         self,
         trial_index: int,
