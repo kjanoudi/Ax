@@ -1158,7 +1158,7 @@ class AxClient(WithDBSettingsBase):
 
     def _validate_trial_data(self, trial: Trial, data: AbstractDataFrameData) -> None:
         for metric_name in data.df["metric_name"].values:
-            if metric_name not in self.experiment.metrics:
+            # if metric_name not in self.experiment.metrics:
                 # logger.info(
                 #     f"Data was logged for metric {metric_name} that was not yet "
                 #     "tracked on the experiment. Please specify `tracking_metric_"
