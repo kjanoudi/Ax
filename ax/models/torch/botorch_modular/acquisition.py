@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import torch
 from ax.core.search_space import SearchSpaceDigest
 from ax.core.types import TConfig
-from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
+from ax.models.torch.botorch_modular.default_options import (
+    get_default_optimizer_options,
+)
 from ax.models.torch.botorch_modular.surrogate import Surrogate
 from ax.models.torch.utils import (
     _get_X_pending_and_observed,
@@ -21,18 +23,13 @@ from ax.models.torch.utils import (
 from ax.utils.common.base import Base
 from ax.utils.common.constants import Keys
 from ax.utils.common.docutils import copy_doc
-from ax.utils.common.typeutils import checked_cast, not_none
 from botorch.acquisition.acquisition import AcquisitionFunction
 from botorch.acquisition.analytic import AnalyticAcquisitionFunction
+from botorch.acquisition.input_constructors import get_acqf_input_constructor
 from botorch.acquisition.objective import AcquisitionObjective
 from botorch.models.model import Model
 from botorch.optim.optimize import optimize_acqf
-from botorch.utils.containers import TrainingData
 from torch import Tensor
-
-
-class Optimizer:  # NOTE: Stub for future BoTorch optimizer class.
-    pass
 
 
 class Acquisition(Base):
@@ -74,20 +71,13 @@ class Acquisition(Base):
 
     surrogate: Surrogate
     acqf: AcquisitionFunction
-    # BoTorch `AcquisitionFunction` class associated with this `Acquisition`
-    # class by default. `None` for the base `Acquisition` class, but can be
-    # specified in subclasses.
-    default_botorch_acqf_class: Optional[Type[AcquisitionFunction]] = None
-    # BoTorch `AcquisitionFunction` class associated with this `Acquisition`
-    # instance. Determined during `__init__`, do not set manually.
-    _botorch_acqf_class: Type[AcquisitionFunction]
 
     def __init__(
         self,
         surrogate: Surrogate,
         search_space_digest: SearchSpaceDigest,
         objective_weights: Tensor,
-        botorch_acqf_class: Optional[Type[AcquisitionFunction]] = None,
+        botorch_acqf_class: Type[AcquisitionFunction],
         options: Optional[Dict[str, Any]] = None,
         pending_observations: Optional[List[Tensor]] = None,
         outcome_constraints: Optional[Tuple[Tensor, Tensor]] = None,
@@ -95,26 +85,10 @@ class Acquisition(Base):
         fixed_features: Optional[Dict[int, float]] = None,
         objective_thresholds: Optional[Tensor] = None,
     ) -> None:
-        if not botorch_acqf_class and not self.default_botorch_acqf_class:
-            raise ValueError(
-                f"Acquisition class {self.__class__} does not specify a default "
-                "BoTorch `AcquisitionFunction`, so `botorch_acqf_class` "
-                "argument must be specified."
-            )
-        self._botorch_acqf_class = not_none(
-            botorch_acqf_class or self.default_botorch_acqf_class
-        )
         self.surrogate = surrogate
         self.options = options or {}
-        trd = self._extract_training_data(surrogate=surrogate)
-        Xs = (
-            # Assumes 1-D objective_weights, which should be safe.
-            [trd.X for o in range(objective_weights.shape[0])]
-            if isinstance(trd, TrainingData)
-            else [i.X for i in trd.values()]
-        )
         X_pending, X_observed = _get_X_pending_and_observed(
-            Xs=Xs,
+            Xs=self.surrogate.training_data.Xs,
             objective_weights=objective_weights,
             bounds=search_space_digest.bounds,
             pending_observations=pending_observations,
@@ -139,7 +113,8 @@ class Acquisition(Base):
         else:
             model = self.surrogate.model
 
-        objective = self._get_botorch_objective(
+        objective = self.get_botorch_objective(
+            botorch_acqf_class=botorch_acqf_class,
             model=model,
             objective_weights=objective_weights,
             objective_thresholds=objective_thresholds,
@@ -156,25 +131,46 @@ class Acquisition(Base):
             fixed_features=fixed_features,
             options=self.options,
         )
-        X_baseline = X_observed
-        overriden_X_baseline = model_deps.get(Keys.X_BASELINE)
-        if overriden_X_baseline is not None:
-            X_baseline = overriden_X_baseline
-            model_deps.pop(Keys.X_BASELINE)
-        self._instantiate_acqf(
+        input_constructor_kwargs = {
+            "X_baseline": X_observed,
+            "X_pending": X_pending,
+            "objective_thresholds": objective_thresholds,
+            "outcome_constraints": outcome_constraints,
+            **model_deps,
+            **self.options,
+        }
+        input_constructor = get_acqf_input_constructor(botorch_acqf_class)
+        acqf_inputs = input_constructor(
             model=model,
+            training_data=self.surrogate.training_data,
             objective=objective,
-            objective_thresholds=objective_thresholds,
-            model_dependent_kwargs=model_deps,
-            X_pending=X_pending,
-            X_baseline=X_baseline,
+            **input_constructor_kwargs,
         )
+        self.acqf = botorch_acqf_class(**acqf_inputs)  # pyre-ignore [45]
+
+    @property
+    def botorch_acqf_class(self) -> Type[AcquisitionFunction]:
+        """BoTorch ``AcquisitionFunction`` class underlying this ``Acquisition``."""
+        return self.acqf.__class__
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Torch data type of the tensors in the training data used in the model,
+        of which this ``Acquisition`` is a subcomponent.
+        """
+        return self.surrogate.dtype
+
+    @property
+    def device(self) -> torch.device:
+        """Torch device type of the tensors in the training data used in the model,
+        of which this ``Acquisition`` is a subcomponent.
+        """
+        return self.surrogate.device
 
     def optimize(
         self,
         n: int,
         search_space_digest: SearchSpaceDigest,
-        optimizer_class: Optional[Optimizer] = None,
         inequality_constraints: Optional[List[Tuple[Tensor, Tensor, float]]] = None,
         fixed_features: Optional[Dict[int, float]] = None,
         rounding_func: Optional[Callable[[Tensor], Tensor]] = None,
@@ -182,21 +178,38 @@ class Acquisition(Base):
     ) -> Tuple[Tensor, Tensor]:
         """Generate a set of candidates via multi-start optimization. Obtains
         candidates and their associated acquisition function values.
+
+        Args:
+            n: The number of candidates to generate.
+            search_space_digest: A ``SearchSpaceDigest`` object containing search space
+                properties, e.g. ``bounds`` for optimization.
+            inequality constraints: A list of tuples (indices, coefficients, rhs),
+                with each tuple encoding an inequality constraint of the form
+                ``sum_i (X[indices[i]] * coefficients[i]) >= rhs``.
+            fixed_features: A map `{feature_index: value}` for features that
+                should be fixed to a particular value during generation.
+            rounding_func: A function that post-processes an optimization
+                result appropriately (i.e., according to `round-trip`
+                transformations).
+            optimizer_options: Options for the optimizer function, e.g. ``sequential``
+                or ``raw_samples``.
         """
         optimizer_options = optimizer_options or {}
         bounds = torch.tensor(
             search_space_digest.bounds, dtype=self.dtype, device=self.device
         ).transpose(0, 1)
         # NOTE: Could make use of `optimizer_class` when its added to BoTorch.
-        return optimize_acqf(
-            acq_function=self.acqf,
-            bounds=bounds,
-            q=n,
-            inequality_constraints=inequality_constraints,
-            fixed_features=fixed_features,
-            post_processing_func=rounding_func,
+        optimizer_inputs = {
+            "acq_function": self.acqf,
+            "bounds": bounds,
+            "q": n,
+            "inequality_constraints": inequality_constraints,
+            "fixed_features": fixed_features,
+            "post_processing_func": rounding_func,
+            **get_default_optimizer_options(acqf_class=self.botorch_acqf_class),
             **optimizer_options,
-        )
+        }
+        return optimize_acqf(**optimizer_inputs)
 
     def evaluate(self, X: Tensor) -> Tensor:
         """Evaluate the acquisition function on the candidate set `X`.
@@ -283,16 +296,9 @@ class Acquisition(Base):
         """
         return {}
 
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.surrogate.dtype
-
-    @property
-    def device(self) -> torch.device:
-        return self.surrogate.device
-
-    def _get_botorch_objective(
+    def get_botorch_objective(
         self,
+        botorch_acqf_class: Type[AcquisitionFunction],
         model: Model,
         objective_weights: Tensor,
         objective_thresholds: Optional[Tensor] = None,
@@ -303,37 +309,9 @@ class Acquisition(Base):
             model=model,
             objective_weights=objective_weights,
             use_scalarized_objective=issubclass(
-                self._botorch_acqf_class, AnalyticAcquisitionFunction
+                botorch_acqf_class, AnalyticAcquisitionFunction
             ),
             outcome_constraints=outcome_constraints,
+            objective_thresholds=objective_thresholds,
             X_observed=X_observed,
         )
-
-    def _instantiate_acqf(
-        self,
-        model: Model,
-        objective: AcquisitionObjective,
-        model_dependent_kwargs: Dict[str, Any],
-        objective_thresholds: Optional[Tensor] = None,
-        X_pending: Optional[Tensor] = None,
-        X_baseline: Optional[Tensor] = None,
-    ) -> None:
-        self.acqf = self._botorch_acqf_class(  # pyre-ignore[28]: Some kwargs are
-            # not expected in base `AcquisitionFunction` but are expected in
-            # its subclasses.
-            model=model,
-            objective=objective,
-            X_pending=X_pending,
-            X_baseline=X_baseline,
-            **self.options,
-            **model_dependent_kwargs,
-        )
-
-    @classmethod
-    def _extract_training_data(
-        cls, surrogate: Surrogate
-    ) -> Union[TrainingData, Dict[str, TrainingData]]:
-        if isinstance(surrogate, ListSurrogate):
-            return checked_cast(dict, surrogate.training_data_per_outcome)
-        else:
-            return checked_cast(TrainingData, surrogate.training_data)

@@ -7,12 +7,13 @@
 
 from collections import OrderedDict
 from datetime import datetime
-from typing import Dict, Iterable, List, MutableMapping, Optional, Type, cast
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Type, cast
 
 import numpy as np
 import pandas as pd
 import torch
 from ax.core.arm import Arm
+from ax.core.base_trial import BaseTrial
 from ax.core.batch_trial import AbandonedArm, BatchTrial
 from ax.core.data import Data
 from ax.core.experiment import DataType, Experiment
@@ -59,7 +60,6 @@ from ax.metrics.factorial import FactorialMetric
 from ax.metrics.hartmann6 import AugmentedHartmann6Metric, Hartmann6Metric
 from ax.modelbridge.factory import Cont_X_trans, get_factorial, get_sobol
 from ax.models.torch.botorch_modular.acquisition import Acquisition
-from ax.models.torch.botorch_modular.kg import KnowledgeGradient
 from ax.models.torch.botorch_modular.list_surrogate import ListSurrogate
 from ax.models.torch.botorch_modular.model import BoTorchModel
 from ax.models.torch.botorch_modular.surrogate import Surrogate
@@ -117,13 +117,14 @@ def get_branin_experiment(
     with_choice_parameter: bool = False,
     search_space: Optional[SearchSpace] = None,
     minimize: bool = False,
+    named: bool = True,
 ) -> Experiment:
     search_space = search_space or get_branin_search_space(
         with_fidelity_parameter=with_fidelity_parameter,
         with_choice_parameter=with_choice_parameter,
     )
     exp = Experiment(
-        name="branin_test_experiment",
+        name="branin_test_experiment" if named else None,
         search_space=search_space,
         optimization_config=get_branin_optimization_config(minimize=minimize)
         if has_optimization_config
@@ -582,6 +583,40 @@ def get_trial() -> Trial:
     trial.runner = SyntheticRunner()
     trial._generation_step_index = 0
     return trial
+
+
+class TestTrial(BaseTrial):
+    "Trial class to test unsupported trial type error"
+
+    _arms: List[Arm] = []
+
+    def __repr__(self) -> str:
+        return "test"
+
+    def _get_candidate_metadata(self, arm_name: str) -> Optional[Dict[str, Any]]:
+        return None
+
+    def _get_candidate_metadata_from_all_generator_runs(
+        self,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+        return {"test": None}
+
+    def abandoned_arms(self) -> str:
+        return "test"
+
+    @property
+    def arms(self) -> List[Arm]:
+        return self._arms
+
+    @arms.setter
+    def arms(self, val: List[Arm]):
+        self._arms = val
+
+    def arms_by_name(self) -> str:
+        return "test"
+
+    def generator_runs(self) -> str:
+        return "test"
 
 
 ##############################
@@ -1191,7 +1226,7 @@ def get_list_surrogate() -> Surrogate:
 
 
 def get_acquisition_type() -> Type[Acquisition]:
-    return KnowledgeGradient
+    return Acquisition
 
 
 def get_model_type() -> Type[Model]:

@@ -32,7 +32,12 @@ from ax.core.batch_trial import BatchTrial
 from ax.core.experiment import Experiment
 from ax.core.metric import Metric
 from ax.core.trial import Trial
-from ax.exceptions.core import DataRequiredError, OptimizationComplete, UnsupportedError
+from ax.exceptions.core import (
+    AxError,
+    DataRequiredError,
+    OptimizationComplete,
+    UnsupportedError,
+)
 from ax.exceptions.generation_strategy import MaxParallelismReachedException
 from ax.modelbridge.generation_strategy import GenerationStrategy
 from ax.modelbridge.modelbridge_utils import (
@@ -56,17 +61,18 @@ scheduler subclass.
 MAX_SECONDS_BETWEEN_POLLS = 300
 
 
-# This number of trials has to have been run in `Scheduler` to start checking
-# failure rate.
-START_CHECKING_FAILURE_RATE_AFTER_N_TRIALS = 10
-
-
 class OptimizationResult(NamedTuple):  # TODO[T61776778]
     pass  # TBD
 
 
-class SchedulerInternalError(Exception):
+class SchedulerInternalError(AxError):
     """Error that indicates an error within the `Scheduler` logic."""
+
+    pass
+
+
+class FailureRateExceededError(AxError):
+    """Error that indicates the sweep was aborted due to excessive failure rate."""
 
     pass
 
@@ -128,10 +134,14 @@ class SchedulerOptions:
         tolerated_trial_failure_rate: Fraction of trials in this
             optimization that are allowed to fail without the whole
             optimization ending. Expects value between 0 and 1.
-            NOTE: Failure rate checks begin once 10 trials are run by
-            the scheduler; after that point if the ratio of failed trials
-            to total trials ran so far exceeds the failure rate, the
-            optimization will halt.
+            NOTE: Failure rate checks begin once
+            min_failed_trials_for_failure_rate_check trials have
+            failed; after that point if the ratio of failed trials
+            to total trials ran so far exceeds the failure rate,
+            the optimization will halt.
+        min_failed_trials_for_failure_rate_check: The minimum number
+            of trials that must fail in `Scheduler` in order to start
+            checking failure rate.
         log_filepath: File, to which to write optimization logs.
         logging_level: Minimum level of logging statements to log,
             defaults to ``logging.INFO``.
@@ -152,6 +162,8 @@ class SchedulerOptions:
         min_seconds_before_poll: Minimum number of seconds between
             beginning to run a trial and the first poll to check
             trial status.
+        seconds_between_polls_backoff_factor: The rate at which the poll
+            interval increases.
         run_trials_in_batches: If True and ``poll_available_capacity`` is
             implemented to return non-null results, trials will be dispatched
             in groups via `run_trials` instead of one-by-one via ``run_trial``.
@@ -166,11 +178,13 @@ class SchedulerOptions:
     trial_type: Type[BaseTrial] = Trial
     total_trials: Optional[int] = None
     tolerated_trial_failure_rate: float = 0.5
+    min_failed_trials_for_failure_rate_check: int = 5
     log_filepath: Optional[str] = None
     logging_level: int = INFO
     ttl_seconds_for_trials: Optional[int] = None
     init_seconds_between_polls: Optional[int] = 1
     min_seconds_before_poll: float = 1.0
+    seconds_between_polls_backoff_factor: float = 1.5
     run_trials_in_batches: bool = False
     debug_log_run_metadata: bool = False
 
@@ -207,6 +221,9 @@ class Scheduler(WithDBSettingsBase, ABC):
     _timeout_hours: Optional[int] = None
     # Timestamp of when the last deployed trial started running.
     _latest_trial_start_timestamp: Optional[float] = None
+    # Will be set to `True` if generation strategy signals that the optimization
+    # is complete, in which case the optimization should gracefully exit early.
+    _optimization_complete: bool = False
 
     def __init__(
         self,
@@ -548,13 +565,24 @@ class Scheduler(WithDBSettingsBase, ABC):
                 f"currently running trials: {len(self.running_trials)})."
             )
             sleep(seconds_between_polls)
-            seconds_between_polls *= 1.5
+            seconds_between_polls *= self.options.seconds_between_polls_backoff_factor
         return self.report_results()[1]
 
     def should_abort(self) -> bool:
         """Checks whether this scheduler has reached some intertuption / abort
         criterion, such as an overall optimization timeout, tolerated failure rate, etc.
         """
+
+        # if failure rate is exceeded, raise an exception.
+        # this check should precede others to ensure it is not skipped.
+        self.error_if_failure_rate_exceeded()
+
+        # if optimization is complete, return True
+        if self._optimization_complete:
+            self.logger.info("Optimization completed, stopping early.")
+            return True
+
+        # if sweep is timed out, return True, else return False
         timed_out = (
             self._timeout_hours is not None
             and self._latest_optimization_start_timestamp is not None
@@ -566,27 +594,52 @@ class Scheduler(WithDBSettingsBase, ABC):
             self.logger.error(
                 "Optimization timed out (timeout hours: " f"{self._timeout_hours})!"
             )
+        return timed_out
+
+    def error_if_failure_rate_exceeded(self, force_check: bool = False) -> None:
+        """Checks if the failure rate (set in scheduler options) has been exceeded.
+
+        Args:
+            force_check: Indicates whether to force a failure-rate check
+                regardless of the number of trials that have been executed. If False
+                (default), the check will be skipped if the sweep has fewer than five
+                failed iterations. If True, the check will be performed unless there
+                are 0 failures.
+        """
+        failed_idcs = self.experiment.trial_indices_by_status[TrialStatus.FAILED]
+        # We only count failed trials with indices that came after the preexisting
+        # trials on experiment before scheduler use.
+        num_failed_in_scheduler = sum(
+            1 for f in failed_idcs if f >= self._num_preexisting_trials
+        )
+
+        # skip check if 0 failures
+        if num_failed_in_scheduler == 0:
+            return
+
+        # skip check if fewer than min_failed_trials_for_failure_rate_check failures
+        # unless force_check is True
+        if (
+            num_failed_in_scheduler
+            < self.options.min_failed_trials_for_failure_rate_check
+            and not force_check
+        ):
+            return
+
         num_ran_in_scheduler = (
             len(self.experiment.trials) - self._num_preexisting_trials
         )
-        failure_rate_exceeded = False
-        if num_ran_in_scheduler > START_CHECKING_FAILURE_RATE_AFTER_N_TRIALS:
-            failed_idcs = self.experiment.trial_indices_by_status[TrialStatus.FAILED]
-            # We only count failed trials with indices that came after the preexisting
-            # trials on experiment before scheduler use.
-            num_failed_in_scheduler = sum(
-                1 for f in failed_idcs if f >= self._num_preexisting_trials
-            )
-            failure_rate_exceeded = (
-                num_failed_in_scheduler / num_ran_in_scheduler
-            ) > self.options.tolerated_trial_failure_rate
+
+        failure_rate_exceeded = (
+            num_failed_in_scheduler / num_ran_in_scheduler
+        ) > self.options.tolerated_trial_failure_rate
 
         if failure_rate_exceeded:
-            self.logger.error(
-                "Tolerated trial failure rate exceeded (ran trials: "
-                f"{num_ran_in_scheduler}, failed: {num_failed_in_scheduler})!"
+            raise FailureRateExceededError(
+                "Tolerated trial failure rate exceeded (at least "
+                f"{num_failed_in_scheduler} out of first {num_ran_in_scheduler} trials "
+                " failed)."
             )
-        return timed_out or failure_rate_exceeded
 
     def summarize_final_result(self) -> OptimizationResult:
         """Get some summary of result: which trial did best, what
@@ -668,6 +721,8 @@ class Scheduler(WithDBSettingsBase, ABC):
             yield self.wait_for_completed_trials_and_report_results()
 
         res = self.wait_for_completed_trials_and_report_results()
+        # raise an error if the failure rate exceeds tolerance at the end of the sweep
+        self.error_if_failure_rate_exceeded(force_check=True)
         self._record_run_trials_status(
             num_preexisting_trials=n_existing, status=RunTrialsStatus.SUCCESS
         )
@@ -752,6 +807,9 @@ class Scheduler(WithDBSettingsBase, ABC):
         if not existing_trials and not new_trials:
             # Unable to gen. new run due to max parallelism limit or need for data
             # or unable to run trials due to lack of capacity.
+            if self._optimization_complete:
+                return False
+
             if not self.has_trials_in_flight:
                 raise SchedulerInternalError(  # pragma: no cover
                     "No trials are running but model requires more data. This is an "
@@ -971,7 +1029,8 @@ class Scheduler(WithDBSettingsBase, ABC):
                 pending_observations=pending,
             )
         except OptimizationComplete as err:
-            self.logger.info(f"Optimization completed: {err}.")
+            self.logger.info(f"Optimization complete: {err}.")
+            self._optimization_complete = True
             return []
         except DataRequiredError as err:
             # TODO[T62606107]: consider adding a `more_data_required` property to

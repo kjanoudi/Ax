@@ -33,7 +33,9 @@ class MultiFidelityAcquisitionTest(TestCase):
         self.X = torch.tensor([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0]])
         self.Y = torch.tensor([[3.0], [4.0]])
         self.Yvar = torch.tensor([[0.0], [2.0]])
-        self.training_data = TrainingData(X=self.X, Y=self.Y, Yvar=self.Yvar)
+        self.training_data = TrainingData.from_block_design(
+            X=self.X, Y=self.Y, Yvar=self.Yvar
+        )
         self.fidelity_features = [2]
         self.surrogate.construct(
             training_data=self.training_data, fidelity_features=self.fidelity_features
@@ -57,22 +59,6 @@ class MultiFidelityAcquisitionTest(TestCase):
             Keys.COST_INTERCEPT: 1.0,
             Keys.NUM_TRACE_OBSERVATIONS: 0,
         }
-        with patch(f"{MFKG_PATH}.__init__", return_value=None):
-            # We don't actually need to instantiate the BoTorch acqf in these tests.
-            self.acquisition = MultiFidelityAcquisition(
-                surrogate=self.surrogate,
-                search_space_digest=self.search_space_digest,
-                objective_weights=self.objective_weights,
-                botorch_acqf_class=qMultiFidelityKnowledgeGradient,
-            )
-
-    @patch(f"{ACQUISITION_PATH}.Acquisition.__init__", return_value=None)
-    @patch(f"{ACQUISITION_PATH}.Acquisition.optimize")
-    def test_optimize(self, mock_Acquisition_optimize, mock_Acquisition_init):
-        # `self.acquisition.optimize()` should call `Acquisition.optimize()`
-        # once.
-        self.acquisition.optimize(n=1, search_space_digest=self.search_space_digest)
-        mock_Acquisition_optimize.assert_called_once()
 
     @patch(
         f"{ACQUISITION_PATH}.Acquisition.compute_model_dependencies", return_value={}
@@ -89,9 +75,22 @@ class MultiFidelityAcquisitionTest(TestCase):
         mock_affine_model,
         mock_Acquisition_compute,
     ):
+        # TODO: Patch only `MFKG_PATH.__init__` once `construct_inputs`
+        # implemented for qMFKG.
+        with patch(
+            f"{MULTI_FIDELITY_PATH}.MultiFidelityAcquisition.__init__",
+            return_value=None,
+        ):
+            # We don't actually need to instantiate the BoTorch acqf in these tests.
+            mf_acquisition = MultiFidelityAcquisition(
+                surrogate=self.surrogate,
+                search_space_digest=self.search_space_digest,
+                objective_weights=self.objective_weights,
+                botorch_acqf_class=qMultiFidelityKnowledgeGradient,
+            )
         # Raise Error if `fidelity_weights` and `target_fidelities` do not align.
         with self.assertRaisesRegex(RuntimeError, "Must provide the same indices"):
-            self.acquisition.compute_model_dependencies(
+            mf_acquisition.compute_model_dependencies(
                 surrogate=self.surrogate,
                 search_space_digest=SearchSpaceDigest(
                     **{
@@ -107,7 +106,7 @@ class MultiFidelityAcquisitionTest(TestCase):
                 options=self.options,
             )
         # Make sure `fidelity_weights` are set when they are not passed in.
-        self.acquisition.compute_model_dependencies(
+        mf_acquisition.compute_model_dependencies(
             surrogate=self.surrogate,
             search_space_digest=SearchSpaceDigest(
                 **{
@@ -126,7 +125,7 @@ class MultiFidelityAcquisitionTest(TestCase):
             fidelity_weights={2: 1.0, 3: 1.0}, fixed_cost=1.0
         )
         # Usual case.
-        dependencies = self.acquisition.compute_model_dependencies(
+        dependencies = mf_acquisition.compute_model_dependencies(
             surrogate=self.surrogate,
             search_space_digest=self.search_space_digest,
             objective_weights=self.objective_weights,

@@ -6,7 +6,7 @@
 
 import dataclasses
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import torch
 from ax.core.search_space import SearchSpaceDigest
@@ -19,8 +19,6 @@ from ax.models.torch.botorch_modular.utils import (
     choose_botorch_acqf_class,
     choose_model_class,
     construct_acquisition_and_optimizer_options,
-    construct_single_training_data,
-    construct_training_data_list,
     use_model_list,
     validate_data_format,
 )
@@ -107,11 +105,9 @@ class BoTorchModel(TorchModel, Base):
             )
         self.surrogate_options = surrogate_options or {}
         self.acquisition_class = acquisition_class or Acquisition
-        # `_botorch_acqf_class` can be set to `None` here. If so,
-        # `Model.gen` will set it with `choose_botorch_acqf_class`.
-        self._botorch_acqf_class = (
-            botorch_acqf_class or self.acquisition_class.default_botorch_acqf_class
-        )
+        # `_botorch_acqf_class` can be `None` here. If so, `Model.gen` or `Model.
+        # evaluate_acquisition_function` will set it with `choose_botorch_acqf_class`.
+        self._botorch_acqf_class = botorch_acqf_class
         self.acquisition_options = acquisition_options or {}
         self.refit_on_update = refit_on_update
         self.refit_on_cv = refit_on_cv
@@ -159,10 +155,7 @@ class BoTorchModel(TorchModel, Base):
             )
 
         self.surrogate.fit(
-            # pyre-ignore[6]: Base `Surrogate` expects only single `TrainingData`,
-            # but `ListSurrogate` expects a list of them, so `training_data` here is
-            # a union of the two.
-            training_data=self._mk_training_data(Xs=Xs, Ys=Ys, Yvars=Yvars),
+            training_data=TrainingData(Xs=Xs, Ys=Ys, Yvars=Yvars),
             search_space_digest=search_space_digest,
             metric_names=metric_names,
             candidate_metadata=candidate_metadata,
@@ -197,10 +190,7 @@ class BoTorchModel(TorchModel, Base):
         )
 
         self.surrogate.update(
-            # pyre-ignore[6]: Base `Surrogate` expects only single `TrainingData`,
-            # but `ListSurrogate` expects a list of them, so `training_data` here is
-            # a union of the two.
-            training_data=self._mk_training_data(Xs=Xs, Ys=Ys, Yvars=Yvars),
+            training_data=TrainingData(Xs=Xs, Ys=Ys, Yvars=Yvars),
             search_space_digest=search_space_digest,
             metric_names=metric_names,
             candidate_metadata=candidate_metadata,
@@ -399,8 +389,20 @@ class BoTorchModel(TorchModel, Base):
         pending_observations: Optional[List[Tensor]] = None,
         acq_options: Optional[Dict[str, Any]] = None,
     ) -> Acquisition:
+        """Set an BoTorch acquisition function class for this model if needed and
+        instantiate it.
+
+        Returns:
+            BoTorch ``AcquisitionFunction`` instance.
+        """
         if not self._botorch_acqf_class:
-            self._botorch_acqf_class = choose_botorch_acqf_class()
+            self._botorch_acqf_class = choose_botorch_acqf_class(
+                objective_thresholds=objective_thresholds,
+                outcome_constraints=outcome_constraints,
+                linear_constraints=linear_constraints,
+                fixed_features=fixed_features,
+                pending_observations=pending_observations,
+            )
 
         return self.acquisition_class(
             surrogate=self.surrogate,
@@ -414,13 +416,3 @@ class BoTorchModel(TorchModel, Base):
             pending_observations=pending_observations,
             options=acq_options,
         )
-
-    def _mk_training_data(
-        self,
-        Xs: List[Tensor],
-        Ys: List[Tensor],
-        Yvars: List[Tensor],
-    ) -> Union[TrainingData, List[TrainingData]]:
-        if isinstance(self.surrogate, ListSurrogate):
-            return construct_training_data_list(Xs=Xs, Ys=Ys, Yvars=Yvars)
-        return construct_single_training_data(Xs=Xs, Ys=Ys, Yvars=Yvars)
