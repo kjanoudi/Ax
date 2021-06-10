@@ -623,6 +623,36 @@ class Experiment(Base):
             trial_data = checked_cast(AbstractDataFrameData, trial_data)
         return trial_data, storage_time
 
+    def lookup_data(
+        self,
+        trial_indices: Optional[Iterable[int]] = None,
+        merge_trial_data: bool = False,
+    ) -> AbstractDataFrameData:
+        """Lookup data for all trials on this experiment and for either the
+        specified metrics or all metrics currently on the experiment, if `metrics`
+        argument is not specified.
+
+        Args:
+            trial_indices: Indices of trials, for which to fetch data.
+            merge_trial_data: Whether to return data across all timestamps.
+
+        Returns:
+            Data for the experiment.
+        """
+        data_by_trial = []
+        trial_indices = trial_indices or list(self.trials.keys())
+        for trial_index in trial_indices:
+            data_by_trial.append(
+                self.lookup_data_for_trial(
+                    trial_index=trial_index, merge_trial_data=merge_trial_data
+                )[0]
+            )
+        if not data_by_trial:
+            return self.default_data_constructor()
+        last_data = data_by_trial[-1]
+        last_data_type = type(last_data)
+        return last_data_type.from_multiple_data(data_by_trial)
+
     @property
     def num_trials(self) -> int:
         """How many trials are associated with this experiment."""

@@ -56,6 +56,7 @@ from ax.core.types import (
     TParameterization,
 )
 from ax.metrics.branin import AugmentedBraninMetric, BraninMetric
+from ax.metrics.branin_map import BraninTimestampMapMetric
 from ax.metrics.factorial import FactorialMetric
 from ax.metrics.hartmann6 import AugmentedHartmann6Metric, Hartmann6Metric
 from ax.modelbridge.factory import Cont_X_trans, get_factorial, get_sobol
@@ -95,7 +96,7 @@ def get_experiment(with_status_quo: bool = True) -> Experiment:
     )
 
 
-def get_experiment_with_map_data():
+def get_experiment_with_map_data_type():
     return Experiment(
         name="test_map_data",
         search_space=get_search_space(),
@@ -149,6 +150,16 @@ def get_branin_experiment(
         exp.new_trial(generator_run=sobol_run)
 
     return exp
+
+
+def get_branin_experiment_with_timestamp_map_metric():
+    return Experiment(
+        name="branin_with_timestamp_map_metric",
+        search_space=get_branin_search_space(),
+        tracking_metrics=[BraninTimestampMapMetric(name="b", param_names=["x1", "x2"])],
+        runner=SyntheticRunner(),
+        default_data_type=DataType.MAP_DATA,
+    )
 
 
 def get_multi_type_experiment(
@@ -299,6 +310,14 @@ def get_experiment_with_data() -> Experiment:
     batch_trial.experiment.attach_data(data=get_data())
     batch_trial.experiment.attach_data(data=get_data())
     return batch_trial.experiment
+
+
+def get_experiment_with_map_data() -> Experiment:
+    experiment = get_experiment_with_map_data_type()
+    experiment.new_trial()
+    experiment.add_tracking_metric(MapMetric("ax_test_metric"))
+    experiment.attach_data(data=get_map_data())
+    return experiment
 
 
 def get_experiment_with_multi_objective() -> Experiment:
@@ -796,8 +815,10 @@ def get_map_objective() -> Objective:
 
 def get_multi_objective() -> Objective:
     return MultiObjective(
-        metrics=[Metric(name="m1"), Metric(name="m3", lower_is_better=True)],
-        minimize=False,
+        objectives=[
+            Objective(metric=Metric(name="m1")),
+            Objective(metric=Metric(name="m3", lower_is_better=True), minimize=True),
+        ],
     )
 
 
@@ -815,9 +836,9 @@ def get_branin_objective(minimize: bool = False) -> Objective:
 
 def get_branin_multi_objective() -> Objective:
     return MultiObjective(
-        metrics=[
-            get_branin_metric(name="branin_a"),
-            get_branin_metric(name="branin_b"),
+        objectives=[
+            Objective(metric=get_branin_metric(name="branin_a")),
+            Objective(metric=get_branin_metric(name="branin_b")),
         ],
         minimize=False,
     )
@@ -1074,7 +1095,7 @@ def get_map_data(trial_index: int = 0) -> MapData:
     }
     return MapData.from_map_evaluations(
         evaluations=evaluations,  # pyre-ignore [6]: Spurious param type mismatch.
-        trial_index=0,
+        trial_index=trial_index,
         map_keys=["epoch"],
     )
 

@@ -206,16 +206,17 @@ def extract_objective_weights(objective: Objective, outcomes: List[str]) -> np.n
         n-length list of weights.
 
     """
-    s = -1.0 if objective.minimize else 1.0
     objective_weights = np.zeros(len(outcomes))
     if isinstance(objective, ScalarizedObjective):
+        s = -1.0 if objective.minimize else 1.0
         for obj_metric, obj_weight in objective.metric_weights:
             objective_weights[outcomes.index(obj_metric.name)] = obj_weight * s
     elif isinstance(objective, MultiObjective):
-        for obj_metric, obj_weight in objective.metric_weights:
-            # Rely on previously extracted lower_is_better weights not objective.
-            objective_weights[outcomes.index(obj_metric.name)] = obj_weight or s
+        for obj, obj_weight in objective.objective_weights:
+            s = -1.0 if obj.minimize else 1.0
+            objective_weights[outcomes.index(obj.metric.name)] = obj_weight * s
     else:
+        s = -1.0 if objective.minimize else 1.0
         objective_weights[outcomes.index(objective.metric.name)] = s
     return objective_weights
 
@@ -455,7 +456,7 @@ def get_pending_observation_features(
     # not pending for the metric. Where only the most recent data matters, this will
     # work, but may need to add logic to check previously added data objects, too.
     for trial_index, trial in experiment.trials.items():
-        dat = trial.fetch_data()
+        dat = trial.lookup_data()
         for metric_name in experiment.metrics:
             if metric_name not in pending_features:
                 pending_features[metric_name] = []
