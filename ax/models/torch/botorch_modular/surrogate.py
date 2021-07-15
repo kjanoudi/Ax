@@ -164,11 +164,11 @@ class Surrogate(Base):
                 "Base `Surrogate` expects training data for single outcome."
             )
 
-        kwargs = kwargs or {}
+        input_constructor_kwargs = {**self.model_options, **(kwargs or {})}
         self._training_data = training_data
 
         formatted_model_inputs = self.botorch_model_class.construct_inputs(
-            training_data=self.training_data, **kwargs
+            training_data=self.training_data, **input_constructor_kwargs
         )
         # pyre-ignore[45]: Py raises informative msg if `model_cls` abstract.
         self._model = self.botorch_model_class(**formatted_model_inputs)
@@ -224,6 +224,8 @@ class Surrogate(Base):
                 **dataclasses.asdict(search_space_digest)
             )
         if state_dict:
+            # pyre-fixme[6]: Expected `OrderedDict[typing.Any, typing.Any]` for 1st
+            #  param but got `Dict[str, Tensor]`.
             self.model.load_state_dict(not_none(state_dict))
 
         if state_dict is None or refit:

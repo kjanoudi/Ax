@@ -18,6 +18,7 @@ from ax.core.experiment import Experiment
 from ax.core.metric import Metric
 from ax.core.objective import Objective
 from ax.core.optimization_config import OptimizationConfig
+from ax.early_stopping.strategies import BaseEarlyStoppingStrategy
 from ax.exceptions.core import OptimizationComplete, UnsupportedError
 from ax.metrics.branin import BraninMetric
 from ax.modelbridge.dispatch_utils import choose_generation_strategy
@@ -26,7 +27,6 @@ from ax.modelbridge.modelbridge_utils import (
     get_pending_observation_features_based_on_trial_status,
 )
 from ax.modelbridge.registry import Models
-from ax.service.early_stopping_strategy import BaseEarlyStoppingStrategy
 from ax.service.scheduler import (
     FailureRateExceededError,
     Scheduler,
@@ -34,6 +34,9 @@ from ax.service.scheduler import (
     SchedulerOptions,
     ExperimentStatusProperties,
     OptimizationResult,
+)
+from ax.service.utils.with_db_settings_base import (
+    WithDBSettingsBase,
 )
 from ax.storage.sqa_store.db import init_test_engine_and_session_factory
 from ax.storage.sqa_store.decoder import Decoder
@@ -48,6 +51,7 @@ from ax.utils.testing.core_stubs import (
     get_branin_search_space,
     get_generator_run,
 )
+from sqlalchemy.orm.exc import StaleDataError
 
 
 class BareBonesTestScheduler(Scheduler):
@@ -183,7 +187,8 @@ class TestAxScheduler(TestCase):
                 "logging_level=20, ttl_seconds_for_trials=None, init_seconds_between_"
                 "polls=10, min_seconds_before_poll=1.0, seconds_between_polls_backoff_"
                 "factor=1.5, run_trials_in_batches=False, "
-                "debug_log_run_metadata=False, early_stopping_strategy=None))"
+                "debug_log_run_metadata=False, early_stopping_strategy=None, "
+                "suppress_storage_errors_after_retries=False))"
             ),
         )
 
@@ -201,6 +206,15 @@ class TestAxScheduler(TestCase):
             scheduler.run_all_trials()
 
     def test_validate_early_stopping_strategy(self):
+        class DummyEarlyStoppingStrategy(BaseEarlyStoppingStrategy):
+            def should_stop_trials_early(
+                self,
+                trial_indices: Set[int],
+                experiment: Experiment,
+                **kwargs: Dict[str, Any],
+            ) -> Set[int]:
+                return {}
+
         with patch(
             f"{BraninMetric.__module__}.BraninMetric.is_available_while_running",
             return_value=False,
@@ -209,7 +223,7 @@ class TestAxScheduler(TestCase):
                 experiment=self.branin_experiment,
                 generation_strategy=self.sobol_GPEI_GS,
                 options=SchedulerOptions(
-                    early_stopping_strategy=BaseEarlyStoppingStrategy()
+                    early_stopping_strategy=DummyEarlyStoppingStrategy()
                 ),
             )
 
@@ -218,7 +232,7 @@ class TestAxScheduler(TestCase):
             experiment=self.branin_experiment,
             generation_strategy=self.sobol_GPEI_GS,
             options=SchedulerOptions(
-                early_stopping_strategy=BaseEarlyStoppingStrategy()
+                early_stopping_strategy=DummyEarlyStoppingStrategy()
             ),
         )
 
@@ -606,7 +620,7 @@ class TestAxScheduler(TestCase):
         # as many times as `total_trials` and yielding from generator after
         # obtaining each new result.
         res_list = list(scheduler.run_trials_and_yield_results(max_trials=total_trials))
-        self.assertEqual(len(res_list), total_trials)
+        self.assertEqual(len(res_list), total_trials + 1)
         self.assertIsInstance(res_list, list)
         self.assertEqual(len(res_list[0]["trials_completed_so_far"]), 1)
         self.assertEqual(len(res_list[1]["trials_completed_so_far"]), 2)
@@ -618,7 +632,7 @@ class TestAxScheduler(TestCase):
                 return {}
 
             def should_stop_trials_early(self, trial_indices: Set[int]):
-                return {TrialStatus.EARLY_STOPPED: trial_indices}
+                return {i: None for i in trial_indices}
 
         total_trials = 3
         scheduler = EarlyStopsInsteadOfNormalCompletionScheduler(
@@ -641,7 +655,7 @@ class TestAxScheduler(TestCase):
             )
             # Two steps complete the experiment given parallelism.
             expected_num_polls = 2
-            self.assertEqual(len(res_list), expected_num_polls)
+            self.assertEqual(len(res_list), expected_num_polls + 1)
             self.assertIsInstance(res_list, list)
             # Both trials in first batch of parallelism will be early stopped
             self.assertEqual(len(res_list[0]["trials_early_stopped_so_far"]), 2)
@@ -663,7 +677,7 @@ class TestAxScheduler(TestCase):
                 trial_indices: Set[int],
                 experiment: Experiment,
                 **kwargs: Dict[str, Any],
-            ) -> Dict[int, Optional[TrialStatus]]:
+            ) -> Dict[int, Optional[str]]:
                 # Make sure that we can lookup data for the trial,
                 # even though we won't use it in this dummy strategy
                 data = experiment.lookup_data(trial_indices=trial_indices)
@@ -672,13 +686,7 @@ class TestAxScheduler(TestCase):
                         f"No data found for trials {trial_indices}; "
                         "can't determine whether or not to stop early."
                     )
-                new_statuses = {}
-                for trial_index in trial_indices:
-                    if trial_index % 2 == 1:
-                        new_statuses[trial_index] = TrialStatus.EARLY_STOPPED
-                    else:
-                        new_statuses[trial_index] = None
-                return new_statuses
+                return {idx: None for idx in trial_indices if idx % 2 == 1}
 
         class SchedulerWithEarlyStoppingStrategy(BareBonesTestScheduler):
             poll_trial_status_count = 0
@@ -709,7 +717,7 @@ class TestAxScheduler(TestCase):
                 scheduler.run_trials_and_yield_results(max_trials=total_trials)
             )
             expected_num_steps = 2
-            self.assertEqual(len(res_list), expected_num_steps)
+            self.assertEqual(len(res_list), expected_num_steps + 1)
             # Trial #1 early stopped in first step
             self.assertEqual(res_list[0]["trials_early_stopped_so_far"], {1})
             # All trials completed by end of second step
@@ -787,3 +795,29 @@ class TestAxScheduler(TestCase):
         scheduler.run_n_trials(max_trials=1)
         # no trials should run if _gen_multiple throws an OptimizationComplete error
         self.assertEqual(len(scheduler.experiment.trials), 0)
+
+    @patch(
+        (
+            f"{WithDBSettingsBase.__module__}.WithDBSettingsBase."
+            "_save_generation_strategy_to_db_if_possible"
+        )
+    )
+    @patch(
+        f"{WithDBSettingsBase.__module__}._save_experiment", side_effect=StaleDataError
+    )
+    def test_suppress_all_storage_errors(self, mock_save_exp, _):
+        init_test_engine_and_session_factory(force_init=True)
+        config = SQAConfig()
+        encoder = Encoder(config=config)
+        decoder = Decoder(config=config)
+        db_settings = DBSettings(encoder=encoder, decoder=decoder)
+        BareBonesTestScheduler(
+            experiment=self.branin_experiment,  # Has runner and metrics.
+            generation_strategy=self.two_sobol_steps_GS,
+            options=SchedulerOptions(
+                init_seconds_between_polls=0.1,  # Short between polls so test is fast.
+                suppress_storage_errors_after_retries=True,
+            ),
+            db_settings=db_settings,
+        )
+        self.assertEqual(mock_save_exp.call_count, 3)

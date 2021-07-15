@@ -36,6 +36,7 @@ from ax.core.experiment import Experiment
 from ax.core.generator_run import GeneratorRun
 from ax.core.observation import ObservationFeatures
 from ax.core.parameter import RangeParameter
+from ax.early_stopping.strategies import BaseEarlyStoppingStrategy
 from ax.modelbridge.base import gen_arms
 from ax.modelbridge.generation_strategy import GenerationStrategy
 from ax.runners.simulated_backend import SimulatedBackendRunner
@@ -79,6 +80,7 @@ class AsyncBenchmarkOptions:
             to the ``AsyncSimulatedBackendScheduler``.
         max_pending_trials: The maximum number of pending trials, which is
             passed to the ``AsyncSimulatedBackendScheduler``.
+        early_stopping_strategy: The early stopping strategy.
     """
 
     scheduler_options: Optional[SchedulerOptions] = None
@@ -86,6 +88,7 @@ class AsyncBenchmarkOptions:
     sample_runtime_func: Optional[Callable[[BaseTrial], float]] = None
     timeout_hours: Optional[int] = None
     max_pending_trials: int = 10
+    early_stopping_strategy: Optional[BaseEarlyStoppingStrategy] = None
 
 
 def benchmark_trial(
@@ -124,7 +127,9 @@ def benchmark_trial(
         return evaluation_function(parameterization), sem  # pyre-ignore[29]: call err.
     else:
         trial_index = not_none(trial_index)
-        return not_none(not_none(experiment).trials.get(trial_index)).fetch_data()
+        trial = not_none(not_none(experiment).trials.get(trial_index))
+        trial.mark_completed()  # Some metrics only fetch data when `COMPLETED`.
+        return trial.fetch_data()  # This also automatically attaches the data.
 
 
 def benchmark_replication(  # One optimization loop.
@@ -507,8 +512,10 @@ def _benchmark_replication_Dev_API(
                 assert batch_size > 1
                 trial = experiment.new_batch_trial(generator_run=gr)
             trial.run()
-            benchmark_trial(experiment=experiment, trial_index=trial_index)
-            trial.mark_completed()
+            # TODO[T94059549]: Rm 3 lines below when attaching data in fetch is fixed.
+            data = benchmark_trial(experiment=experiment, trial_index=trial_index)
+            if not data.df.empty:
+                experiment.attach_data(data=data)
         except Exception as err:  # TODO[T53975770]: test
             if raise_all_exceptions:
                 raise
@@ -556,7 +563,10 @@ def _benchmark_replication_Async_Scheduler(
         name=experiment_name,
         search_space=problem.search_space,
         optimization_config=problem.optimization_config,
-        runner=SimulatedBackendRunner(simulator=backend_simulator),
+        runner=SimulatedBackendRunner(
+            simulator=backend_simulator,
+            sample_runtime_func=async_benchmark_options.sample_runtime_func,
+        ),
     )
 
     scheduler_options = async_benchmark_options.scheduler_options or SchedulerOptions(
@@ -565,6 +575,7 @@ def _benchmark_replication_Async_Scheduler(
         min_seconds_before_poll=1.0,
         seconds_between_polls_backoff_factor=1.0,
         logging_level=logging.INFO if verbose_logging else logging.WARNING,
+        early_stopping_strategy=async_benchmark_options.early_stopping_strategy,
     )
 
     scheduler = AsyncSimulatedBackendScheduler(
@@ -583,6 +594,7 @@ def _benchmark_replication_Async_Scheduler(
         metadata_dict = {
             "start_time": sim_trial.sim_start_time,
             "queued_time": sim_trial.sim_queued_time,
+            "completed_time": sim_trial.sim_completed_time,
         }
         experiment.trials[sim_trial.trial_index].update_run_metadata(metadata_dict)
     return experiment, []

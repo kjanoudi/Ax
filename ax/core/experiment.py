@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import logging
 from collections import OrderedDict, defaultdict
 from datetime import datetime
@@ -19,6 +21,7 @@ from ax.core.batch_trial import BatchTrial
 from ax.core.data import Data
 from ax.core.generator_run import GeneratorRun
 from ax.core.map_data import MapData
+from ax.core.map_metric import MapMetric
 from ax.core.metric import Metric
 from ax.core.optimization_config import OptimizationConfig
 from ax.core.parameter import Parameter
@@ -27,12 +30,11 @@ from ax.core.search_space import SearchSpace
 from ax.core.trial import Trial
 from ax.exceptions.core import UnsupportedError
 from ax.utils.common.base import Base
-from ax.utils.common.constants import Keys
+from ax.utils.common.constants import Keys, EXPERIMENT_IS_TEST_WARNING
 from ax.utils.common.docutils import copy_doc
 from ax.utils.common.logger import get_logger
 from ax.utils.common.timeutils import current_timestamp_in_millis
-from ax.utils.common.typeutils import checked_cast
-
+from ax.utils.common.typeutils import checked_cast, not_none
 
 logger: logging.Logger = get_logger(__name__)
 
@@ -84,6 +86,7 @@ class Experiment(Base):
         # appease pyre
         self._search_space: SearchSpace
         self._status_quo: Optional[Arm] = None
+        self._is_test: bool
 
         self._name = name
         self.description = description
@@ -97,7 +100,14 @@ class Experiment(Base):
         self._time_created: datetime = datetime.now()
         self._trials: Dict[int, BaseTrial] = {}
         self._properties: Dict[str, Any] = properties or {}
-        self._default_data_type = default_data_type or DataType.DATA
+        self._default_data_type = default_data_type or (
+            DataType.MAP_DATA
+            if (
+                optimization_config is not None
+                and isinstance(optimization_config.objective.metrics[0], MapMetric)
+            )
+            else DataType.DATA
+        )
         # Used to keep track of whether any trials on the experiment
         # specify a TTL. Since trials need to be checked for their TTL's
         # expiration often, having this attribute helps avoid unnecessary
@@ -135,6 +145,18 @@ class Experiment(Base):
     def name(self, name: str) -> None:
         """Set experiment name."""
         self._name = name
+
+    @property
+    def is_test(self) -> bool:
+        """Get whether the experiment is a test."""
+        return self._is_test
+
+    @is_test.setter
+    def is_test(self, is_test: bool) -> None:
+        """Set whether the experiment is a test."""
+        if is_test:
+            logger.info(EXPERIMENT_IS_TEST_WARNING)
+        self._is_test = is_test
 
     @property
     def is_simple_experiment(self):
@@ -498,16 +520,20 @@ class Experiment(Base):
             data: Data object to store.
             combine_with_last_data: By default, when attaching data, it's identified
                 by its timestamp, and `experiment.lookup_data_for_trial` returns
-                data by most recent timestamp. In some cases, however, the goal
-                is to combine all data attached for a trial into a single Data
-                object. To achieve that goal, every call to `attach_data` after
+                data by most recent timestamp. Sometimes, however, we attach
+                data for some metrics at one point and data for the rest of the
+                metrics later on. In this case, we actually want to combine the
+                data so that one dataframe contains data for all metrics.
+                To achieve that goal, every call to `attach_data` after
                 the initial data is attached to trials, should be set to `True`.
-                Then, the newly attached data will be appended to existing data,
-                rather than stored as a separate object, and `lookup_data_for_trial`
-                will return the combined data object, rather than just the most
-                recently added data. This will validate that the newly added data
-                does not contain observations for the metrics that already have
-                observations in the most recent data stored.
+                In this case, we will take the most recent previously attached
+                data, append the newly attached data to it, and attach a new
+                Data object with the merged result. Afterwards, calls to
+                `lookup_data_for_trial` will return this combined data object,
+                rather than just the most recently added data. This operation
+                will also validate that the newly added data does not contain
+                observations for the metrics that already have observations in
+                the most recent data stored.
 
         Returns:
             Timestamp of storage in millis.
@@ -549,13 +575,9 @@ class Experiment(Base):
                         f"observation for metric {merged.head()['metric_name']}."
                     )
                 last_data_type = type(last_data)
-                # pyre-ignore [6]: 2nd Param is `AbstractData`,
-                #   but we know class is concrete.
                 current_trial_data[cur_time_millis] = last_data_type.from_multiple_data(
                     [
                         last_data,
-                        # pyre-ignore [45]: Cannot instantiate abstract class.
-                        #   But we know the class is concrete.
                         last_data_type(trial_df, **data_init_args),
                     ]
                 )
@@ -591,7 +613,7 @@ class Experiment(Base):
         return self.default_data_constructor.from_multiple_data(trial_datas)
 
     def lookup_data_for_trial(
-        self, trial_index: int, merge_trial_data: bool = False
+        self, trial_index: int, merge_across_timestamps: bool = False
     ) -> Tuple[AbstractDataFrameData, int]:
         """Lookup stored data for a specific trial.
 
@@ -600,7 +622,7 @@ class Experiment(Base):
 
         Args:
             trial_index: The index of the trial to lookup data for.
-            merge_trial_data: Whether to return Data from all timestamps instead
+            merge_across_timestamps: Whether to return Data from all timestamps instead
                 of only the latest.
 
         Returns:
@@ -616,7 +638,7 @@ class Experiment(Base):
 
         storage_time = max(trial_data_dict.keys())
         trial_data = trial_data_dict[storage_time]
-        if merge_trial_data:
+        if merge_across_timestamps:
             trial_data = trial_data.from_multiple_data(
                 data=list(trial_data_dict.values())
             )
@@ -626,7 +648,7 @@ class Experiment(Base):
     def lookup_data(
         self,
         trial_indices: Optional[Iterable[int]] = None,
-        merge_trial_data: bool = False,
+        merge_across_timestamps: bool = False,
     ) -> AbstractDataFrameData:
         """Lookup data for all trials on this experiment and for either the
         specified metrics or all metrics currently on the experiment, if `metrics`
@@ -634,7 +656,7 @@ class Experiment(Base):
 
         Args:
             trial_indices: Indices of trials, for which to fetch data.
-            merge_trial_data: Whether to return data across all timestamps.
+            merge_across_timestamps: Whether to return data across all timestamps.
 
         Returns:
             Data for the experiment.
@@ -644,7 +666,8 @@ class Experiment(Base):
         for trial_index in trial_indices:
             data_by_trial.append(
                 self.lookup_data_for_trial(
-                    trial_index=trial_index, merge_trial_data=merge_trial_data
+                    trial_index=trial_index,
+                    merge_across_timestamps=merge_across_timestamps,
                 )[0]
             )
         if not data_by_trial:
@@ -824,6 +847,88 @@ class Experiment(Base):
         )
         self._trials[index] = trial
         return index
+
+    def warm_start_from_old_experiment(self, old_experiment: Experiment) -> List[Trial]:
+        """Copy all completed trials with data from an old Ax expeirment to this one.
+        This function checks that the parameters of each trial are members of the
+        current experiment's search_space.
+
+        NOTE: Currently only handles experiments with 1-arm ``Trial``-s, not
+        ``BatchTrial``-s as there has not yet been need for support of the latter.
+
+        Args:
+            old_experiment: The experiment from which to transfer trials and data
+
+        Returns:
+            List of trials successfully copied from old_experiment to this one
+        """
+        if len(self.trials) > 0:
+            raise ValueError(  # pragma: no cover
+                f"Can only warm-start experiments that don't yet have trials. "
+                f"Experiment {self.name} has {len(self.trials)} trials."
+            )
+
+        old_parameter_names = set(old_experiment.search_space.parameters.keys())
+        parameter_names = set(self.search_space.parameters.keys())
+        if old_parameter_names.symmetric_difference(parameter_names):
+            raise ValueError(  # pragma: no cover
+                f"Cannot warm-start experiment '{self.name}' from experiment "
+                f"'{old_experiment.name}' due to mismatch in search space parameters."
+                f"Parameters in '{self.name}' but not in '{old_experiment.name}': "
+                f"{old_parameter_names - parameter_names}. Vice-versa: "
+                f"{parameter_names - old_parameter_names}."
+            )
+
+        old_completed_trials = old_experiment.trials_by_status[TrialStatus.COMPLETED]
+        copied_trials = []
+        for trial in old_completed_trials:
+            if not isinstance(trial, Trial):
+                raise NotImplementedError(  # pragma: no cover
+                    "Only experiments with 1-arm trials currently supported."
+                )
+            self.search_space.check_membership(
+                not_none(trial.arm).parameters, raise_error=True
+            )
+            dat, ts = old_experiment.lookup_data_for_trial(trial_index=trial.index)
+            if ts != -1 and not dat.df.empty:
+                # Trial has data, so we replicate it on the new experiment.
+                new_trial = self.new_trial()
+                new_trial.add_arm(not_none(trial.arm).clone(clear_name=True))
+                new_trial.mark_running(no_runner_required=True)
+                new_trial.update_run_metadata(
+                    {"run_id": trial.run_metadata.get("run_id")}
+                )
+                new_trial._properties["source"] = (
+                    f"Warm start from Experiment: `{old_experiment.name}`, "
+                    f"trial: `{trial.index}`"
+                )
+                # Set trial index and arm name to their values in new trial.
+                new_df = dat.df.copy()
+                new_df["trial_index"].replace(
+                    {trial.index: new_trial.index}, inplace=True
+                )
+                new_df["arm_name"].replace(
+                    {not_none(trial.arm).name: not_none(new_trial.arm).name},
+                    inplace=True,
+                )
+                # Attach updated data to new trial on experiment and mark trial
+                # as completed.
+                self.attach_data(data=Data(df=new_df))
+                new_trial.mark_completed()
+                copied_trials.append(new_trial)
+
+        if self._name is not None:
+            logger.info(
+                f"Copied {len(copied_trials)} completed trials and their data "
+                f"from {old_experiment.name} to {self.name}."
+            )
+        else:
+            logger.info(
+                f"Copied {len(copied_trials)} completed trials and their data "
+                f"from {old_experiment.name}."
+            )
+
+        return copied_trials
 
     def _name_and_store_arm_if_not_exists(self, arm: Arm, proposed_name: str) -> None:
         """Tries to lookup arm with same signature, otherwise names and stores it.

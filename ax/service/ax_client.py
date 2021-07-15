@@ -19,6 +19,8 @@ from ax.core.base_trial import BaseTrial
 from ax.core.batch_trial import BatchTrial
 from ax.core.experiment import DataType, Experiment
 from ax.core.generator_run import GeneratorRun
+from ax.core.objective import MultiObjective
+from ax.core.objective import Objective
 from ax.core.trial import Trial
 from ax.core.types import (
     TEvaluationOutcome,
@@ -27,7 +29,7 @@ from ax.core.types import (
     TParamValue,
 )
 from ax.exceptions.constants import CHOLESKY_ERROR_ANNOTATION
-from ax.exceptions.core import UnsupportedPlotError
+from ax.exceptions.core import UnsupportedPlotError, UnsupportedError
 from ax.modelbridge.dispatch_utils import choose_generation_strategy
 from ax.modelbridge.generation_strategy import GenerationStrategy
 from ax.modelbridge.modelbridge_utils import get_pending_observation_features
@@ -40,6 +42,8 @@ from ax.service.utils.instantiation import (
     data_from_evaluations,
     make_experiment,
     raw_data_to_evaluation,
+    ObjectiveProperties,
+    build_objective_threshold,
 )
 from ax.service.utils.report_utils import exp_to_df
 from ax.service.utils.with_db_settings_base import DBSettings, WithDBSettingsBase
@@ -131,7 +135,9 @@ class AxClient(WithDBSettingsBase):
         verbose_logging: bool = True,
         suppress_storage_errors: bool = False,
     ) -> None:
-        super().__init__(db_settings=db_settings)
+        super().__init__(
+            db_settings=db_settings, suppress_all_errors=suppress_storage_errors
+        )
         if not verbose_logging:
             logger.setLevel(logging.WARNING)  # pragma: no cover
         else:
@@ -162,10 +168,10 @@ class AxClient(WithDBSettingsBase):
         parameters: List[Dict[str, Union[TParamValue, List[TParamValue]]]],
         name: Optional[str] = None,
         objective_name: Optional[str] = None,
-        objectives: Optional[Dict[str, str]] = None,
-        objective_thresholds: Optional[List[str]] = None,
-        minimize: bool = False,
+        minimize: Optional[bool] = None,
+        objectives: Optional[Dict[str, ObjectiveProperties]] = None,
         parameter_constraints: Optional[List[str]] = None,
+        objective_thresholds: Optional[List[str]] = None,
         outcome_constraints: Optional[List[str]] = None,
         status_quo: Optional[TParameterization] = None,
         overwrite_existing_experiment: bool = False,
@@ -197,10 +203,15 @@ class AxClient(WithDBSettingsBase):
                 parameters,
                 4. "is_ordered" (bool) for choice parameters, and
                 5. "is_task" (bool) for task parameters.
-            objective: Name of the metric used as objective in this experiment.
-                This metric must be present in `raw_data` argument to `complete_trial`.
             name: Name of the experiment to be created.
-            minimize: Whether this experiment represents a minimization problem.
+            objective_name[DEPRECATED]: Name of the metric used as objective
+                in this experiment. This metric must be present in `raw_data`
+                argument to `complete_trial`.
+            minimize[DEPRECATED]: Whether this experiment represents a minimization
+                 problem.
+            objectives: Mapping from an objective name to object containing:
+                minimize: Whether this experiment represents a minimization problem.
+                threshold: The bound in the objective's threshold constraint.
             parameter_constraints: List of string representation of parameter
                 constraints, such as "x3 >= x4" or "-x3 + 2*x4 - 3.5*x5 >= 2". For
                 the latter constraints, any number of arguments is accepted, and
@@ -233,13 +244,36 @@ class AxClient(WithDBSettingsBase):
             is_test: Whether this experiment will be a test experiment (useful for
                 marking test experiments in storage etc). Defaults to False.
         """
+        objective_kwargs = {}
+        if (objective_name or minimize is not None) and objectives:
+            raise UnsupportedError(
+                "You may either pass an an objective object "
+                "or an objective_name and minimize param, but not both"
+            )
+        elif objectives and len(objectives.keys()) == 1:
+            objective = next(iter(objectives.keys()))
+            objective_kwargs["objective_name"] = objective
+            objective_kwargs["minimize"] = objectives[objective].minimize
+        elif objectives:
+            objective_kwargs["objectives"] = {
+                objective: ("minimize" if properties.minimize else "maximize")
+                for objective, properties in objectives.items()
+            }
+            objective_kwargs["objective_thresholds"] = objective_thresholds or [
+                build_objective_threshold(objective, properties)
+                for objective, properties in objectives.items()
+            ]
+        elif objective_name or minimize is not None:
+            objective_kwargs["objective_name"] = objective_name
+            objective_kwargs["minimize"] = minimize or False
+            warnings.warn(
+                "objective_name and minimize are deprecated",
+                category=DeprecationWarning,
+            )
+
         experiment = make_experiment(
             name=name,
             parameters=parameters,
-            objectives=objectives,
-            objective_thresholds=objective_thresholds,
-            objective_name=objective_name,
-            minimize=minimize,
             parameter_constraints=parameter_constraints,
             outcome_constraints=outcome_constraints,
             status_quo=status_quo,
@@ -248,6 +282,7 @@ class AxClient(WithDBSettingsBase):
             support_intermediate_data=support_intermediate_data,
             immutable_search_space_and_opt_config=immutable_search_space_and_opt_config,
             is_test=is_test,
+            **objective_kwargs,
         )
         self._set_experiment(
             experiment=experiment,
@@ -258,7 +293,6 @@ class AxClient(WithDBSettingsBase):
         )
         self._save_generation_strategy_to_db_if_possible(
             generation_strategy=self.generation_strategy,
-            suppress_all_errors=self._suppress_storage_errors,
         )
 
     @retry_on_exception(
@@ -295,14 +329,12 @@ class AxClient(WithDBSettingsBase):
         self._save_or_update_trial_in_db_if_possible(
             experiment=self.experiment,
             trial=trial,
-            suppress_all_errors=self._suppress_storage_errors,
         )
         # TODO[T79183560]: Ensure correct handling of generator run when using
         # foreign keys.
         self._update_generation_strategy_in_db_if_possible(
             generation_strategy=self.generation_strategy,
             new_generator_runs=[self.generation_strategy._generator_runs[-1]],
-            suppress_all_errors=self._suppress_storage_errors,
         )
         return not_none(trial.arm).parameters, trial.index
 
@@ -486,7 +518,6 @@ class AxClient(WithDBSettingsBase):
             trial._run_metadata = metadata
         self._save_experiment_to_db_if_possible(
             experiment=self.experiment,
-            suppress_all_errors=self._suppress_storage_errors,
         )
 
     def attach_trial(
@@ -515,7 +546,6 @@ class AxClient(WithDBSettingsBase):
         self._save_or_update_trial_in_db_if_possible(
             experiment=self.experiment,
             trial=trial,
-            suppress_all_errors=self._suppress_storage_errors,
         )
         return not_none(trial.arm).parameters, trial.index
 
@@ -577,8 +607,15 @@ class AxClient(WithDBSettingsBase):
         """
         if not self.experiment.trials:
             raise ValueError("Cannot generate plot as there are no trials.")
-        # pyre-fixme[16]: `Optional` has no attribute `objective`.
-        objective_name = self.experiment.optimization_config.objective.metric.name
+
+        objective = self.objective
+        if isinstance(objective, MultiObjective):
+            raise UnsupportedError(
+                "`get_optimization_trace` is not supported "
+                "for multi-objective experiments"
+            )
+
+        objective_name = self.objective_name
         best_objectives = np.array(
             [
                 [
@@ -596,7 +633,7 @@ class AxClient(WithDBSettingsBase):
         return optimization_trace_single_method(
             y=(
                 np.minimum.accumulate(best_objectives, axis=1)
-                if self.experiment.optimization_config.objective.minimize
+                if objective.minimize
                 else np.maximum.accumulate(best_objectives, axis=1)
             ),
             optimum=objective_optimum,
@@ -639,9 +676,15 @@ class AxClient(WithDBSettingsBase):
                 "If `param_x` is provided, `param_y` is "
                 "required as well, and vice-versa."
             )
-        objective_name = self.objective_name
+
         if not metric_name:
-            metric_name = objective_name
+            if isinstance(self.objective, MultiObjective):
+                raise UnsupportedError(
+                    "`get_contour_plot` requires a `metric_name` "
+                    "for multi-objective experiments"
+                )
+
+            metric_name = self.objective_name
 
         if not param_x or not param_y:
             parameter_names = list(self.experiment.parameters.keys())
@@ -747,7 +790,6 @@ class AxClient(WithDBSettingsBase):
             )
             self._save_generation_strategy_to_db_if_possible(
                 generation_strategy=self.generation_strategy,
-                suppress_all_errors=self._suppress_storage_errors,
             )
         else:
             self._generation_strategy = generation_strategy
@@ -890,10 +932,24 @@ class AxClient(WithDBSettingsBase):
         return not_none(self._generation_strategy)
 
     @property
+    def objective(self) -> Objective:
+        return not_none(self.experiment.optimization_config).objective
+
+    @property
     def objective_name(self) -> str:
         """Returns the name of the objective in this optimization."""
-        opt_config = not_none(self.experiment.optimization_config)
-        return opt_config.objective.metric.name
+        objective = self.objective
+        if isinstance(objective, MultiObjective):
+            raise UnsupportedError(
+                "Multi-objective experiments contain multiple objectives"
+            )
+        return objective.metric.name
+
+    @property
+    def objective_names(self) -> List[str]:
+        """Returns the name of the objective in this optimization."""
+        objective = self.objective
+        return [m.name for m in objective.metrics]
 
     @property
     def objective(self) -> str:
@@ -930,7 +986,6 @@ class AxClient(WithDBSettingsBase):
         self._save_or_update_trial_in_db_if_possible(
             experiment=self.experiment,
             trial=trial,
-            suppress_all_errors=self._suppress_storage_errors,
         )
         return str(
             _round_floats_for_logging(item=evaluations[next(iter(evaluations.keys()))])
@@ -990,7 +1045,6 @@ class AxClient(WithDBSettingsBase):
         try:
             self._save_experiment_to_db_if_possible(
                 experiment=self.experiment,
-                suppress_all_errors=self._suppress_storage_errors,
             )
         except Exception:
             # Unset the experiment on this `AxClient` instance if encountered and
@@ -1017,6 +1071,7 @@ class AxClient(WithDBSettingsBase):
         if self._generation_strategy is None:
             self._generation_strategy = choose_generation_strategy(
                 search_space=self.experiment.search_space,
+                optimization_config=self.experiment.optimization_config,
                 enforce_sequential_optimization=enforce_sequential_optimization,
                 random_seed=random_seed,
                 **choose_generation_strategy_kwargs,
@@ -1103,15 +1158,22 @@ class AxClient(WithDBSettingsBase):
             raise ValueError(
                 f"Arms {not_trial_arm_names} are not part of trial #{trial.index}."
             )
-        if type(self.objective) == MultiObjective:
-            evaluations = raw_data
-        else:
-            evaluations = {
-                arm_name: raw_data_to_evaluation(
-                    raw_data=raw_data[arm_name], objective_name=self.objective_name
-                )
-                for arm_name in raw_data
-            }
+        # if type(self.objective) == MultiObjective:
+        #     evaluations = raw_data
+        # else:
+        #     evaluations = {
+        #         arm_name: raw_data_to_evaluation(
+        #             raw_data=raw_data[arm_name], objective_name=self.objective_name
+        #         )
+        #         for arm_name in raw_data
+        #     }
+
+        evaluations = {
+            arm_name: raw_data_to_evaluation(
+                raw_data=raw_data[arm_name], objective=self.objective
+            )
+            for arm_name in raw_data
+        }
         data = data_from_evaluations(
             evaluations=evaluations,
             trial_index=trial.index,

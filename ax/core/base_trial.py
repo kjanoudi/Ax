@@ -67,12 +67,17 @@ class TrialStatus(int, Enum):
             self == TrialStatus.ABANDONED
             or self == TrialStatus.COMPLETED
             or self == TrialStatus.FAILED
+            or self == TrialStatus.EARLY_STOPPED
         )
 
     @property
     def expecting_data(self) -> bool:
         """True if trial is expecting data."""
-        return self == TrialStatus.RUNNING or self == TrialStatus.COMPLETED
+        return (
+            self == TrialStatus.RUNNING
+            or self == TrialStatus.COMPLETED
+            or self == TrialStatus.EARLY_STOPPED
+        )
 
     @property
     def is_deployed(self) -> bool:
@@ -103,6 +108,11 @@ class TrialStatus(int, Enum):
     def is_running(self) -> bool:
         """True if this trial is a running one."""
         return self == TrialStatus.RUNNING
+
+    @property
+    def is_early_stopped(self) -> bool:
+        """True if this trial is an early stopped one."""
+        return self == TrialStatus.EARLY_STOPPED
 
     # pyre-fixme[14]: `__format__` overrides method defined in `object` inconsistently.
     def __format__(self, fmt: str) -> str:
@@ -198,6 +208,7 @@ class BaseTrial(ABC, SortableBase):
 
         self._abandoned_reason: Optional[str] = None
         self._run_metadata: Dict[str, Any] = {}
+        self._stop_metadata: Dict[str, Any] = {}
 
         self._runner: Optional[Runner] = None
 
@@ -291,6 +302,14 @@ class BaseTrial(ABC, SortableBase):
         return self._run_metadata
 
     @property
+    def stop_metadata(self) -> Dict[str, Any]:
+        """Dict containing metadata from the stopping process.
+
+        This is set implicitly during `trial.stop()`.
+        """
+        return self._stop_metadata
+
+    @property
     def trial_type(self) -> Optional[str]:
         """The type of the trial.
 
@@ -324,6 +343,12 @@ class BaseTrial(ABC, SortableBase):
         self._run_metadata.update(metadata)
         return self._run_metadata
 
+    def update_stop_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Updates the stop metadata dict stored on this trial and returns the
+        updated dict."""
+        self._stop_metadata.update(metadata)
+        return self._stop_metadata
+
     def run(self) -> BaseTrial:
         """Deploys the trial according to the behavior on the runner.
 
@@ -352,18 +377,60 @@ class BaseTrial(ABC, SortableBase):
             self.mark_running()
         return self
 
-    def complete(self) -> BaseTrial:
+    def stop(self, new_status: TrialStatus, reason: Optional[str] = None) -> BaseTrial:
+        """Stops the trial according to the behavior on the runner.
+
+        The runner returns a `stop_metadata` dict containining metadata
+        of the stopping process.
+
+        Args:
+            new_status: The new TrialStatus. Must be one of {TrialStatus.COMPLETED,
+                TrialStatus.ABANDONED, TrialStatus.EARLY_STOPPED}
+            reason: A message containing information why the trial is to be stopped.
+
+        Returns:
+            The trial instance.
+        """
+        if self.status not in {TrialStatus.STAGED, TrialStatus.RUNNING}:
+            raise ValueError("Can only stop STAGED or RUNNING trials.")
+
+        if new_status not in {
+            TrialStatus.COMPLETED,
+            TrialStatus.ABANDONED,
+            TrialStatus.EARLY_STOPPED,
+        }:
+            raise ValueError(
+                "New status of a stopped trial must either be "
+                "COMPLETED, ABANDONED or EARLY_STOPPED."
+            )
+
+        # Default to experiment runner if trial doesn't have one
+        self.assign_runner()
+        if self._runner is None:
+            raise ValueError("No runner set on trial or experiment.")
+        runner = not_none(self._runner)
+
+        self._stop_metadata = runner.stop(self, reason=reason)
+        self.mark_as(new_status)
+        return self
+
+    def complete(self, reason: Optional[str] = None) -> BaseTrial:
         """Stops the trial if functionality is defined on runner
             and marks trial completed.
+
+        Args:
+            reason: A message containing information why the trial is to be
+                completed.
 
         Returns:
             The trial instance.
         """
         if self.status != TrialStatus.RUNNING:
             raise ValueError("Can only stop a running trial.")
-
-        not_none(self._runner).stop(self)
-        self.mark_completed()
+        try:
+            self.stop(new_status=TrialStatus.COMPLETED, reason=reason)
+        except NotImplementedError:
+            self.mark_completed()
         return self
 
     def fetch_data(
@@ -384,11 +451,24 @@ class BaseTrial(ABC, SortableBase):
             trial_index=self.index, metrics=metrics, **kwargs
         )
 
-    def lookup_data(self, **kwargs: Any) -> AbstractDataFrameData:
-        merge_trial_data = kwargs.get("merge_trial_data", False)
+    def lookup_data(
+        self, merge_across_timestamps: bool = False
+    ) -> AbstractDataFrameData:
+        """Lookup cached data on experiment for this trial.
+
+        Args:
+            merge_across_timestamps: Whether to return all ``Data`` objects
+            for this trial, merged together. ``Data`` objects are identified
+            by trial index and timestamp in Ax.
+
+        Returns:
+            If not merging across timestamps, the latest ``Data`` object
+            associated with the trial. If merging, all data for trial, merged.
+
+        """
         return self.experiment.lookup_data_for_trial(
             trial_index=self.index,
-            merge_trial_data=merge_trial_data,
+            merge_across_timestamps=merge_across_timestamps,
         )[0]
 
     def _check_existing_and_name_arm(self, arm: Arm) -> None:

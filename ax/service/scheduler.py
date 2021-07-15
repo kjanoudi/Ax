@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
@@ -33,6 +32,7 @@ from ax.core.batch_trial import BatchTrial
 from ax.core.experiment import Experiment
 from ax.core.metric import Metric
 from ax.core.trial import Trial
+from ax.early_stopping.strategies import BaseEarlyStoppingStrategy
 from ax.exceptions.core import (
     AxError,
     DataRequiredError,
@@ -44,7 +44,6 @@ from ax.modelbridge.generation_strategy import GenerationStrategy
 from ax.modelbridge.modelbridge_utils import (
     get_pending_observation_features_based_on_trial_status,
 )
-from ax.service.early_stopping_strategy import BaseEarlyStoppingStrategy
 from ax.service.utils.with_db_settings_base import DBSettings, WithDBSettingsBase
 from ax.utils.common.constants import Keys
 from ax.utils.common.executils import retry_on_exception
@@ -58,6 +57,11 @@ This method is not implemented in the base `Scheduler` class.
 If this functionality is desired, specify the method in the
 scheduler subclass.
 """
+GS_TYPE_MSG = "This optimization run uses a '{gs_name}' generation strategy."
+OPTIMIZATION_COMPLETION_MSG = """Optimization completed with total of {num_trials}
+trials attached to the underlying Ax experiment '{experiment_name}'.
+"""
+
 
 # Wait time b/w polls will not exceed 5 mins.
 MAX_SECONDS_BETWEEN_POLLS = 300
@@ -178,6 +182,11 @@ class SchedulerOptions:
         early_stopping_strategy: A ``BaseEarlyStoppingStrategy`` that determines
             whether a trial should be stopped given the current state of
             the experiment. Used in ``should_stop_trials_early``.
+        suppress_storage_errors_after_retries: Whether to fully suppress SQL
+            storage-related errors if encounted, after retrying the call
+            multiple times. Only use if SQL storage is not important for the given
+            use case, since this will only log, but not raise, an exception if
+            its encountered while saving to DB or loading from it.
     """
 
     trial_type: Type[BaseTrial] = Trial
@@ -193,6 +202,7 @@ class SchedulerOptions:
     run_trials_in_batches: bool = False
     debug_log_run_metadata: bool = False
     early_stopping_strategy: Optional[BaseEarlyStoppingStrategy] = None
+    suppress_storage_errors_after_retries: bool = False
 
 
 class Scheduler(WithDBSettingsBase, ABC):
@@ -216,6 +226,11 @@ class Scheduler(WithDBSettingsBase, ABC):
     generation_strategy: GenerationStrategy
     options: SchedulerOptions
     logger: LoggerAdapter
+    # Mapping of form {short string identifier -> message to show in reported
+    # results}. This is a mapping and not a list to allow for changing of
+    # some sweep messages throughout the course of the optimization (e.g. progress
+    # report of the optimization).
+    markdown_messages: Dict[str, str]
 
     # Number of trials that existed on the scheduler's experiment before
     # the scheduler instantiation with that experiment.
@@ -255,7 +270,9 @@ class Scheduler(WithDBSettingsBase, ABC):
 
         # Initialize storage layer for the scheduler.
         super().__init__(
-            db_settings=db_settings, logging_level=self.options.logging_level
+            db_settings=db_settings,
+            logging_level=self.options.logging_level,
+            suppress_all_errors=self.options.suppress_storage_errors_after_retries,
         )
 
         # Set up logger with an optional filepath handler
@@ -281,6 +298,9 @@ class Scheduler(WithDBSettingsBase, ABC):
         # when trials are not generated for the same reason multiple times in
         # a row.
         self._log_next_no_trials_reason = True
+        self.markdown_messages = {
+            "generation_strategy": GS_TYPE_MSG.format(gs_name=generation_strategy.name)
+        }
 
     @classmethod
     def get_default_db_settings(cls) -> DBSettings:
@@ -511,7 +531,9 @@ class Scheduler(WithDBSettingsBase, ABC):
             )
         return not_none(self.experiment.runner).run(trial=trial)
 
-    def stop_trial_runs(self, trials: List[BaseTrial]) -> None:
+    def stop_trial_runs(
+        self, trials: List[BaseTrial], reasons: Optional[List[Optional[str]]] = None
+    ) -> None:
         """Stops the jobs that execute given trials.
 
         Used if, for example, TTL for a trial was specified and expired, or poor
@@ -524,6 +546,8 @@ class Scheduler(WithDBSettingsBase, ABC):
 
         Args:
             trials: Trials to be stopped.
+            reasons: A list of strings describing the reasons for why the
+                trials are to be stopped (in the same order).
         """
         if len(trials) == 0:
             return
@@ -535,16 +559,21 @@ class Scheduler(WithDBSettingsBase, ABC):
                 "on a subclass of `Scheduler` as a substitute of a runner."
             )
 
-        for trial in trials:
-            not_none(self.experiment.runner).stop(trial=trial)
+        runner = not_none(self.experiment.runner)
+        if reasons is None:
+            reasons = [None] * len(trials)
 
-    def stop_trial_run(self, trial: BaseTrial) -> None:
+        for trial, reason in zip(trials, reasons):
+            runner.stop(trial=trial, reason=reason)
+
+    def stop_trial_run(self, trial: BaseTrial, reason: Optional[str] = None) -> None:
         """Stops the job that executes a given trial.
 
         Args:
             trial: Trial to be stopped.
+            reason: The reason the trial is to be stopped.
         """
-        self.stop_trial_runs(trials=[trial])
+        self.stop_trial_runs(trials=[trial], reasons=[reason])
 
     @retry_on_exception(retries=3, no_retry_on_exception_types=NO_RETRY_EXCEPTIONS)
     def run_trials(self, trials: Iterable[BaseTrial]) -> Dict[int, Dict[str, Any]]:
@@ -687,7 +716,7 @@ class Scheduler(WithDBSettingsBase, ABC):
 
     def run_trials_and_yield_results(
         self, max_trials: int, timeout_hours: Optional[int] = None
-    ) -> Generator[Dict[str, Any], None, Dict[str, Any]]:
+    ) -> Generator[Dict[str, Any], None, None]:
         """Make continuous calls to `run` and `process_results` to run up to
         ``max_trials`` trials, until completion criterion is reached. This is the 'main'
         method of a ``Scheduler``.
@@ -706,7 +735,8 @@ class Scheduler(WithDBSettingsBase, ABC):
                 raise ValueError(f"Expected `timeout_hours` >= 0, got {timeout_hours}.")
             self._timeout_hours = timeout_hours
 
-        assert max_trials >= 0, "Expected `max_trials` >= 0."
+        if max_trials < 0:
+            raise ValueError(f"Expected `max_trials` >= 0, got {max_trials}.")
         trials = self.experiment.trials
         n_existing = len(self.experiment.trials)
 
@@ -718,13 +748,15 @@ class Scheduler(WithDBSettingsBase, ABC):
         # schedule new trials and poll existing ones in a loop.
         while not self.completion_criterion() and len(trials) - n_existing < max_trials:
             if self.should_abort():
-                res = self.report_results()
+                self._record_optimization_complete_message()
                 self._record_run_trials_status(
                     num_preexisting_trials=n_existing, status=RunTrialsStatus.ABORTED
                 )
-                # pyre-fixme[7]: Expected `Generator[Dict[str, typing.Any], None,
-                # None]` but got `Dict[str, typing.Any]`. T84274305
-                return res
+                self._record_run_trials_status(
+                    num_preexisting_trials=n_existing, status=RunTrialsStatus.ABORTED
+                )
+                yield self.wait_for_completed_trials_and_report_results()
+                return
 
             # Run new trial evaluations until `run` returns `False`, which
             # means that there was a reason not to run more evaluations yet.
@@ -735,7 +767,6 @@ class Scheduler(WithDBSettingsBase, ABC):
                 remaining_to_run = max_trials + n_existing - len(self.experiment.trials)
 
             # Wait for trial evaluations to complete and process results.
-            # pyre-fixme[7]: T84274305, as above
             yield self.wait_for_completed_trials_and_report_results()
 
         # When done scheduling, wait for the remaining trials to finish running
@@ -747,22 +778,24 @@ class Scheduler(WithDBSettingsBase, ABC):
             )
         while self.running_trials:
             if self.should_abort():
-                res = self.report_results()
+                self._record_optimization_complete_message()
                 self._record_run_trials_status(
                     num_preexisting_trials=n_existing, status=RunTrialsStatus.ABORTED
                 )
-                return res  # pyre-fixme[7]: T84274305, as above
+                yield self.wait_for_completed_trials_and_report_results()
+                return
 
-            # pyre-fixme[7]: T84274305, as above
             yield self.wait_for_completed_trials_and_report_results()
 
+        self._record_optimization_complete_message()
         res = self.wait_for_completed_trials_and_report_results()
         # raise an error if the failure rate exceeds tolerance at the end of the sweep
         self.error_if_failure_rate_exceeded(force_check=True)
         self._record_run_trials_status(
             num_preexisting_trials=n_existing, status=RunTrialsStatus.SUCCESS
         )
-        return res  # pyre-fixme[7]: T84274305, as above
+        yield res
+        return
 
     def run_n_trials(
         self, max_trials: int, timeout_hours: Optional[int] = None
@@ -961,24 +994,20 @@ class Scheduler(WithDBSettingsBase, ABC):
             already_fetched_trial_idcs = running_trial_indices
 
         # 3. Determine which trials to stop early
-        early_stopping_new_status_to_trial_idcs = self.should_stop_trials_early(
+        stop_trial_info = self.should_stop_trials_early(
             trial_indices=running_trial_indices
         )
 
         # 4. Stop trials early
-        # Note: We early-stop all trials returned from should_stop_trials_early,
-        # regardless of their TrialStatus value.
-        stop_trial_idcs = itertools.chain.from_iterable(
-            early_stopping_new_status_to_trial_idcs.values()
-        )
         self.stop_trial_runs(
-            trials=[self.experiment.trials[trial_idx] for trial_idx in stop_trial_idcs]
+            trials=[self.experiment.trials[trial_idx] for trial_idx in stop_trial_info],
+            reasons=list(stop_trial_info.values()),
         )
 
         # 5. Update trial statuses on the experiment
         new_status_to_trial_idcs = self._update_status_dict(
             status_dict=new_status_to_trial_idcs,
-            updating_status_dict=early_stopping_new_status_to_trial_idcs,
+            updating_status_dict={TrialStatus.EARLY_STOPPED: set(stop_trial_info)},
         )
         updated_trials = []
         for status, trial_idcs in new_status_to_trial_idcs.items():
@@ -1013,34 +1042,30 @@ class Scheduler(WithDBSettingsBase, ABC):
 
         self.logger.debug(f"Updating {len(updated_trials)} trials in DB.")
         self._save_or_update_trials_in_db_if_possible(
-            experiment=self.experiment, trials=updated_trials
+            experiment=self.experiment,
+            trials=updated_trials,
         )
         return updated_any_trial
 
     def should_stop_trials_early(
         self, trial_indices: Set[int]
-    ) -> Dict[TrialStatus, Set[int]]:
+    ) -> Dict[int, Optional[str]]:
         """Evaluate whether to early-stop running trials.
 
         Args:
             trial_indices: Indices of trials to consider for early stopping.
 
         Returns:
-            Dict with new suggested ``TrialStatus`` as keys and a set of
-            indices of trials to update (subset of initially-passed trials) as values.
+            A set of indices of trials to early-stop (will be a subset of
+            initially-passed trials).
         """
         if self.options.early_stopping_strategy is None:
             return {}
 
         early_stopping_strategy = not_none(self.options.early_stopping_strategy)
-        new_status_to_trial_idcs = defaultdict(set)
-        maybe_new_trial_statuses = early_stopping_strategy.should_stop_trials_early(
+        return early_stopping_strategy.should_stop_trials_early(
             trial_indices=trial_indices, experiment=self.experiment
         )
-        for idx, maybe_new_trial_status in maybe_new_trial_statuses.items():
-            if maybe_new_trial_status is not None:
-                new_status_to_trial_idcs[maybe_new_trial_status].add(idx)
-        return new_status_to_trial_idcs
 
     def _validate_options(self, options: SchedulerOptions) -> None:
         """Validates `SchedulerOptions` for compatibility with given
@@ -1323,6 +1348,19 @@ class Scheduler(WithDBSettingsBase, ABC):
                 ExperimentStatusProperties.NUM_TRIALS_RUN_PER_CALL.value
             ] = new_trials
         self._append_to_experiment_properties(to_append=to_append)
+
+    def _record_optimization_complete_message(self) -> None:
+        """Adds a simple optimization completion message to this scheduler's markdown
+        messages.
+        """
+        self.markdown_messages[
+            "optimization_completion"
+        ] = OPTIMIZATION_COMPLETION_MSG.format(
+            num_trials=len(self.experiment.trials),
+            experiment_name=self.experiment.name
+            if self.experiment._name is not None
+            else "unnamed",
+        )
 
     def _append_to_experiment_properties(self, to_append: Dict[str, Any]) -> None:
         """Appends to list fields in experiment properties based on ``to_append``

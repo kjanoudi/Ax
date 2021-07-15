@@ -87,6 +87,7 @@ from ax.utils.testing.core_stubs import (
     get_scalarized_outcome_constraint,
     get_fixed_parameter,
     get_generator_run,
+    get_map_data,
     get_multi_objective_optimization_config,
     get_multi_type_experiment,
     get_objective,
@@ -341,6 +342,18 @@ class SQAStoreTest(TestCase):
         loaded_experiment = load_experiment(self.experiment.name)
         self.assertEqual(self.experiment, loaded_experiment)
 
+        exp = get_experiment_with_map_data_type()
+        save_experiment(exp)
+        new_trial = exp.new_batch_trial(generator_run=get_generator_run())
+        exp.attach_data(get_map_data(trial_index=new_trial.index))
+        save_or_update_trials(
+            experiment=exp,
+            trials=[new_trial],
+            batch_size=2,
+        )
+        loaded_experiment = load_experiment(exp.name)
+        self.assertEqual(exp, loaded_experiment)
+
     def testSaveValidation(self):
         with self.assertRaises(ValueError):
             save_experiment(self.experiment.trials[0])
@@ -372,8 +385,8 @@ class SQAStoreTest(TestCase):
             if class_ == "SimpleExperiment":
                 # Evaluation functions will be different, so need to do
                 # this so equality test passes
-                with self.assertRaises(Exception):
-                    converted_object.evaluation_function()
+                with self.assertRaises(RuntimeError):
+                    converted_object.evaluation_function(parameterization={})
 
                 original_object.evaluation_function = None
                 converted_object.evaluation_function = None
@@ -1266,19 +1279,19 @@ class SQAStoreTest(TestCase):
 
         # changing the name of an experiment is not allowed
         exp.name = "new name"
-        with self.assertRaisesRegex(Exception, ".* Changing the name .*"):
+        with self.assertRaisesRegex(ValueError, ".* Changing the name .*"):
             save_experiment(exp)
 
         # changing the name to an experiment that already exists
         # is also not allowed
         exp.name = "test2"
-        with self.assertRaisesRegex(Exception, ".* database with the name .*"):
+        with self.assertRaisesRegex(ValueError, ".* database with the name .*"):
             save_experiment(exp)
 
         # can't use a name that's already been used
         exp3 = get_experiment()
         exp3.name = "test1"
-        with self.assertRaisesRegex(Exception, ".* experiment already exists .*"):
+        with self.assertRaisesRegex(ValueError, ".* experiment already exists .*"):
             save_experiment(exp3)
 
     def testExperimentSaveAndDelete(self):
@@ -1380,8 +1393,9 @@ class SQAStoreTest(TestCase):
         # add repeated arms to new trial, ensuring
         # we create completely new arms in DB for the
         # new trials
-        trial = experiment.new_batch_trial()
-        trial.add_arms_and_weights(experiment.trials[0].arms)
+        experiment.new_batch_trial(
+            generator_run=GeneratorRun(arms=experiment.trials[0].arms)
+        )
         save_experiment(experiment)
         self.assertEqual(get_session().query(SQAArm).count(), 7)
 

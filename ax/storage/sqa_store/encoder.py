@@ -11,6 +11,7 @@ from ax.core.abstract_data import AbstractDataFrameData
 from ax.core.arm import Arm
 from ax.core.base_trial import BaseTrial
 from ax.core.batch_trial import AbandonedArm, BatchTrial
+from ax.core.data import Data
 from ax.core.experiment import Experiment
 from ax.core.generator_run import GeneratorRun, GeneratorRunType
 from ax.core.metric import Metric
@@ -86,13 +87,13 @@ class Encoder:
         """Validates required experiment metadata."""
         if experiment.db_id is not None:
             if existing_sqa_experiment_id is None:
-                raise Exception(
+                raise ValueError(
                     f"Experiment with ID {experiment.db_id} was already saved to the "
                     "database with a different name. Changing the name of an "
                     "experiment is not allowed."
                 )
             elif experiment.db_id != existing_sqa_experiment_id:
-                raise Exception(
+                raise ValueError(
                     f"experiment.db_id = {experiment.db_id} but the experiment in the "
                     f"database with the name {experiment.name} has the id "
                     f"{existing_sqa_experiment_id}."
@@ -100,7 +101,7 @@ class Encoder:
         else:
             # experiment.db_id is None
             if existing_sqa_experiment_id is not None:
-                raise Exception(
+                raise ValueError(
                     f"An experiment already exists with the name {experiment.name}. "
                     "If you need to override this existing experiment, first delete it "
                     "via `delete_experiment` in ax/ax/storage/sqa_store/delete.py, "
@@ -848,6 +849,7 @@ class Encoder:
             optimize_for_power=optimize_for_power,
             ttl_seconds=trial.ttl_seconds,
             run_metadata=trial.run_metadata,
+            stop_metadata=trial.stop_metadata,
             status=trial.status,
             status_quo_name=status_quo_name,
             time_completed=trial.time_completed,
@@ -868,7 +870,7 @@ class Encoder:
     ) -> SQAData:
         """Convert Ax data to SQLAlchemy."""
         # pyre-fixme: Expected `Base` for 1st...ot `typing.Type[Data]`.
-        data_class: SQAData = self.config.class_to_sqa_class[type(data)]
+        data_class: SQAData = self.config.class_to_sqa_class[Data]
         import json
 
         # pyre-fixme[29]: `SQAData` is not a function.

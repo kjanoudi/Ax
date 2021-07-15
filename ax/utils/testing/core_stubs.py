@@ -152,10 +152,18 @@ def get_branin_experiment(
     return exp
 
 
-def get_branin_experiment_with_timestamp_map_metric():
+def get_branin_experiment_with_timestamp_map_metric(rate: Optional[float] = None):
     return Experiment(
         name="branin_with_timestamp_map_metric",
         search_space=get_branin_search_space(),
+        optimization_config=OptimizationConfig(
+            objective=Objective(
+                metric=BraninTimestampMapMetric(
+                    name="branin", param_names=["x1", "x2"], rate=rate
+                ),
+                minimize=True,
+            )
+        ),
         tracking_metrics=[BraninTimestampMapMetric(name="b", param_names=["x1", "x2"])],
         runner=SyntheticRunner(),
         default_data_type=DataType.MAP_DATA,
@@ -446,36 +454,38 @@ def get_branin_search_space(
 
 def get_factorial_search_space() -> SearchSpace:
     return SearchSpace(
-        # Expected `List[ax.core.parameter.Parameter]` for 2nd parameter
-        # `parameters` to call `ax.core.search_space.SearchSpace.__init__` but
-        # got `List[ChoiceParameter]`.
         parameters=[
             ChoiceParameter(
                 name="factor1",
                 parameter_type=ParameterType.STRING,
-                # Expected `List[typing.Optional[typing.Union[bool, float, str]]]` for
-                # 4th parameter `values` to call
-                # `ax.core.parameter.ChoiceParameter.__init__` but got
-                # `List[str]`.
                 values=["level11", "level12", "level13"],
             ),
             ChoiceParameter(
                 name="factor2",
                 parameter_type=ParameterType.STRING,
-                # Expected `List[typing.Optional[typing.Union[bool, float, str]]]` for
-                # 4th parameter `values` to call
-                # `ax.core.parameter.ChoiceParameter.__init__` but got
-                # `List[str]`.
                 values=["level21", "level22"],
             ),
             ChoiceParameter(
                 name="factor3",
                 parameter_type=ParameterType.STRING,
-                # Expected `List[typing.Optional[typing.Union[bool, float, str]]]` for
-                # 4th parameter `values` to call
-                # `ax.core.parameter.ChoiceParameter.__init__` but got
-                # `List[str]`.
                 values=["level31", "level32", "level33", "level34"],
+            ),
+        ]
+    )
+
+
+def get_large_factorial_search_space() -> SearchSpace:
+    return SearchSpace(
+        parameters=[
+            ChoiceParameter(
+                name="factor1",
+                parameter_type=ParameterType.STRING,
+                values=[f"level1{i}" for i in range(7)],
+            ),
+            ChoiceParameter(
+                name="factor2",
+                parameter_type=ParameterType.STRING,
+                values=[f"level2{i}" for i in range(10)],
             ),
         ]
     )
@@ -840,7 +850,6 @@ def get_branin_multi_objective() -> Objective:
             Objective(metric=get_branin_metric(name="branin_a")),
             Objective(metric=get_branin_metric(name="branin_b")),
         ],
-        minimize=False,
     )
 
 
@@ -899,10 +908,16 @@ def get_branin_multi_objective_optimization_config(
     objective_thresholds = (
         [
             ObjectiveThreshold(
-                metric=get_branin_metric(name="branin_a"), bound=10, op=ComparisonOp.GEQ
+                metric=get_branin_metric(name="branin_a"),
+                bound=10,
+                op=ComparisonOp.GEQ,
+                relative=False,
             ),
             ObjectiveThreshold(
-                metric=get_branin_metric(name="branin_b"), bound=20, op=ComparisonOp.GEQ
+                metric=get_branin_metric(name="branin_b"),
+                bound=20,
+                op=ComparisonOp.GEQ,
+                relative=False,
             ),
         ]
         if has_objective_thresholds

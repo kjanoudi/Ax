@@ -4,6 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from typing import Type
 from unittest.mock import patch
 
@@ -20,13 +21,14 @@ from ax.core.search_space import SearchSpace
 from ax.exceptions.core import UnsupportedError
 from ax.metrics.branin import BraninMetric
 from ax.runners.synthetic import SyntheticRunner
-from ax.utils.common.constants import Keys
+from ax.utils.common.constants import Keys, EXPERIMENT_IS_TEST_WARNING
 from ax.utils.common.testutils import TestCase
 from ax.utils.testing.core_stubs import (
     get_arm,
     get_branin_arms,
     get_branin_optimization_config,
     get_branin_search_space,
+    get_branin_experiment,
     get_branin_experiment_with_timestamp_map_metric,
     get_data,
     get_experiment,
@@ -35,6 +37,7 @@ from ax.utils.testing.core_stubs import (
     get_map_data,
     get_optimization_config,
     get_search_space,
+    get_sobol,
     get_status_quo,
     get_scalarized_outcome_constraint,
 )
@@ -371,7 +374,9 @@ class ExperimentTest(TestCase):
         self.assertEqual(len(exp.lookup_data_for_ts(t2).df), 4 * n)
 
         # Test merging multiple timestamps of data
-        self.assertEqual(len(exp.lookup_data_for_trial(0, merge_trial_data=True)), 2)
+        self.assertEqual(
+            len(exp.lookup_data_for_trial(0, merge_across_timestamps=True)), 2
+        )
 
         with self.assertRaisesRegex(ValueError, ".* for metric"):
             exp.attach_data(batch_data, combine_with_last_data=True)
@@ -676,16 +681,16 @@ class ExperimentWithMapDataTest(TestCase):
         self.experiment.attach_data(remaining_epochs)
         self.experiment.trials[0].mark_completed()
 
-        # merge_trial_data = False
+        # merge_across_timestamps = False
         expected_data = remaining_epochs
         actual_data = self.experiment.lookup_data()  # False by default.
         self.assertEqual(expected_data, actual_data)
 
-        # merge_trial_data = True
+        # merge_across_timestamps = True
         expected_data = MapData.from_map_evaluations(
             evaluations=evaluations, trial_index=0
         )
-        actual_data = self.experiment.lookup_data(merge_trial_data=True)
+        actual_data = self.experiment.lookup_data(merge_across_timestamps=True)
         self.assertEqual(expected_data, actual_data)
 
     def testFetchTrialsData(self):
@@ -713,7 +718,7 @@ class ExperimentWithMapDataTest(TestCase):
         # Try to fetch data when there are only metrics and no attached data.
         exp.remove_tracking_metric(metric_name="b")  # Remove implemented metric.
         exp.add_tracking_metric(MapMetric(name="b"))  # Add unimplemented metric.
-        self.assertEqual(len(exp.fetch_trials_data(trial_indices=[0]).df), 15)
+        self.assertEqual(len(exp.fetch_trials_data(trial_indices=[0]).df), 30)
         # Try fetching attached data.
         exp.attach_data(batch_0_data)
         exp.attach_data(batch_1_data)
@@ -741,3 +746,105 @@ class ExperimentWithMapDataTest(TestCase):
             actual_data = experiment.lookup_data()
             expected_data = get_map_data()
             self.assertEqual(expected_data, actual_data)
+
+    def testWarmStartFromOldExperiment(self):
+        # create old_experiment
+        len_old_trials = 5
+        i_failed_trial = 3
+        old_experiment = get_branin_experiment()
+        for i_old_trial in range(len_old_trials):
+            sobol_run = get_sobol(search_space=old_experiment.search_space).gen(n=1)
+            trial = old_experiment.new_trial(generator_run=sobol_run)
+            trial.mark_running(no_runner_required=True)
+            if i_old_trial == i_failed_trial:
+                trial.mark_failed()
+            else:
+                trial.mark_completed()
+        # make metric noiseless for exact reproducibility
+        old_experiment.optimization_config.objective.metric.noise_sd = 0
+        old_experiment.fetch_data()
+
+        # should fail if new_experiment has trials
+        new_experiment = get_branin_experiment(with_trial=True)
+        with self.assertRaisesRegex(ValueError, "Experiment.*has.*trials"):
+            new_experiment.warm_start_from_old_experiment(old_experiment=old_experiment)
+
+        # should fail if search spaces are different
+        with self.assertRaisesRegex(ValueError, "mismatch in search space parameters"):
+            self.experiment.warm_start_from_old_experiment(
+                old_experiment=old_experiment
+            )
+
+        # check that all non-failed trials are copied to new_experiment
+        new_experiment = get_branin_experiment()
+        # make metric noiseless for exact reproducibility
+        new_experiment.optimization_config.objective.metric.noise_sd = 0
+        new_experiment.warm_start_from_old_experiment(old_experiment=old_experiment)
+        self.assertEqual(len(new_experiment.trials), len(old_experiment.trials) - 1)
+        i_old_trial = 0
+        for _, trial in new_experiment.trials.items():
+            # skip failed trial
+            i_old_trial += i_old_trial == i_failed_trial
+            self.assertEqual(
+                trial.arm.parameters, old_experiment.trials[i_old_trial].arm.parameters
+            )
+            self.assertRegex(
+                trial._properties["source"], "Warm start.*Experiment.*trial"
+            )
+            i_old_trial += 1
+
+        # Check that the data was attached for correct trials
+        old_df = old_experiment.fetch_data().df
+        new_df = new_experiment.fetch_data().df
+
+        self.assertEqual(len(new_df), len_old_trials - 1)
+        pd.testing.assert_frame_equal(
+            old_df.drop(["arm_name", "trial_index"], axis=1),
+            new_df.drop(["arm_name", "trial_index"], axis=1),
+        )
+
+    def test_is_test_warning(self):
+        experiments_module = "ax.core.experiment"
+        with self.subTest("it warns on construction for a test"):
+            with self.assertLogs(experiments_module, level=logging.INFO) as logger:
+                exp = Experiment(
+                    search_space=get_search_space(),
+                    is_test=True,
+                )
+                self.assertIn(
+                    f"INFO:{experiments_module}:{EXPERIMENT_IS_TEST_WARNING}",
+                    logger.output,
+                )
+
+        with self.subTest("it does not warn on construction for a non test"):
+            with self.assertLogs(experiments_module, level=logging.INFO) as logger:
+                logging.getLogger(experiments_module).info(
+                    "there must be at least one log or the assertLogs statement fails"
+                )
+                exp = Experiment(
+                    search_space=get_search_space(),
+                    is_test=False,
+                )
+                self.assertNotIn(
+                    f"INFO:{experiments_module}:{EXPERIMENT_IS_TEST_WARNING}",
+                    logger.output,
+                )
+
+        with self.subTest("it warns on setting is_test to True"):
+            with self.assertLogs(experiments_module, level=logging.INFO) as logger:
+                exp.is_test = True
+                self.assertIn(
+                    f"INFO:{experiments_module}:{EXPERIMENT_IS_TEST_WARNING}",
+                    logger.output,
+                )
+
+        with self.subTest("it does not warn on setting is_test to False"):
+            with self.assertLogs(experiments_module, level=logging.INFO) as logger:
+                logging.getLogger(experiments_module).info(
+                    "there must be at least one log or the assertLogs statement fails"
+                )
+                exp.is_test = False
+                self.assertNotIn(
+                    f"INFO:{experiments_module}:{EXPERIMENT_IS_TEST_WARNING}",
+                    logger.output,
+                )

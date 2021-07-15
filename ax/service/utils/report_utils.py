@@ -20,8 +20,11 @@ from ax.core.objective import MultiObjective, ScalarizedObjective
 from ax.core.search_space import SearchSpace
 from ax.core.trial import BaseTrial, Trial
 from ax.modelbridge import ModelBridge
+from ax.modelbridge.cross_validation import cross_validate
 from ax.modelbridge.generation_strategy import GenerationStrategy
 from ax.plot.contour import interact_contour_plotly
+from ax.plot.diagnostic import interact_cross_validation_plotly
+from ax.plot.feature_importances import plot_feature_importance_by_feature_plotly
 from ax.plot.slice import plot_slice_plotly
 from ax.plot.trace import optimization_trace_single_method_plotly
 from ax.utils.common.logger import get_logger
@@ -31,12 +34,17 @@ from ax.utils.common.typeutils import checked_cast, not_none
 logger: Logger = get_logger(__name__)
 
 
+# pyre-ignore[11]: Annotation `go.Figure` is not defined as a type.
+def _get_cross_validation_plot(model: ModelBridge) -> go.Figure:
+    cv = cross_validate(model)
+    return interact_cross_validation_plotly(cv)
+
+
 def _get_objective_trace_plot(
     experiment: Experiment,
     metric_name: str,
     model_transitions: List[int],
     optimization_direction: Optional[str] = None,
-    # pyre-ignore[11]: Annotation `go.Figure` is not defined as a type.
 ) -> Optional[go.Figure]:
     best_objectives = np.array([experiment.fetch_data().df["mean"]])
     return optimization_trace_single_method_plotly(
@@ -149,7 +157,7 @@ def _get_shortest_unique_suffix_dict(
 
 
 def get_standard_plots(
-    experiment: Experiment, generation_strategy: GenerationStrategy
+    experiment: Experiment, generation_strategy: Optional[GenerationStrategy]
 ) -> List[go.Figure]:
     """Extract standard plots for single-objective optimization.
 
@@ -198,7 +206,11 @@ def get_standard_plots(
         _get_objective_trace_plot(
             experiment=experiment,
             metric_name=not_none(experiment.optimization_config).objective.metric.name,
-            model_transitions=generation_strategy.model_transitions,
+            # TODO: Adjust `model_transitions` to case where custom trials are present
+            # and generation strategy does not start right away.
+            model_transitions=not_none(generation_strategy).model_transitions
+            if generation_strategy is not None
+            else [],
             optimization_direction=(
                 "minimize"
                 if not_none(experiment.optimization_config).objective.minimize
@@ -207,20 +219,27 @@ def get_standard_plots(
         )
     )
 
-    try:
-        output_plot_list.append(
-            _get_objective_v_param_plot(
-                search_space=experiment.search_space,
-                model=not_none(generation_strategy.model),
-                metric_name=not_none(
-                    experiment.optimization_config
-                ).objective.metric.name,
-                trials=experiment.trials,
+    # Objective vs. parameter plot requires a `Model`, so add it only if model
+    # is alrady available. In cases where initially custom trials are attached,
+    # model might not yet be set on the generation strategy.
+    if generation_strategy and generation_strategy.model:
+        model = not_none(not_none(generation_strategy).model)
+        try:
+            output_plot_list.append(
+                _get_objective_v_param_plot(
+                    search_space=experiment.search_space,
+                    model=model,
+                    metric_name=not_none(
+                        experiment.optimization_config
+                    ).objective.metric.name,
+                    trials=experiment.trials,
+                )
             )
-        )
-    except NotImplementedError:
-        # Model does not implement `predict` method.
-        pass
+            output_plot_list.append(plot_feature_importance_by_feature_plotly(model))
+            output_plot_list.append(_get_cross_validation_plot(model))
+        except NotImplementedError:
+            # Model does not implement `predict` method.
+            pass
 
     return [plot for plot in output_plot_list if plot is not None]
 
@@ -228,7 +247,6 @@ def get_standard_plots(
 def exp_to_df(
     exp: Experiment,
     metrics: Optional[List[Metric]] = None,
-    key_components: Optional[List[str]] = None,
     run_metadata_fields: Optional[List[str]] = None,
     **kwargs: Any,
 ) -> pd.DataFrame:
@@ -241,9 +259,6 @@ def exp_to_df(
     Args:
         exp: An Experiment that may have pending trials.
         metrics: Override list of metrics to return. Return all metrics if None.
-        key_components: fields that combine to make a unique key corresponding
-            to rows, similar to the list of fields passed to a GROUP BY.
-            Defaults to ['arm_name', 'trial_index'].
         run_metadata_fields: fields to extract from trial.run_metadata for trial
             in experiment.trials. If there are multiple arms per trial, these
             fields will be replicated across the arms of a trial.
@@ -251,7 +266,9 @@ def exp_to_df(
             objects from call-site to the `fetch_data` callback.
 
     Returns:
-        DataFrame: A dataframe of inputs and metrics by trial and arm.
+        DataFrame: A dataframe of inputs, metadata and metrics by trial and arm. If
+        no trials are available, returns an empty dataframe. If no metric ouputs are
+        available, returns a dataframe of inputs and metadata.
     """
 
     def prep_return(
@@ -259,47 +276,49 @@ def exp_to_df(
     ) -> pd.DataFrame:
         return not_none(not_none(df.drop(drop_col, axis=1)).sort_values(sort_by))
 
-    key_components = key_components or ["trial_index", "arm_name"]
-
     # Accept Experiment and SimpleExperiment
     if isinstance(exp, MultiTypeExperiment):
         raise ValueError("Cannot transform MultiTypeExperiments to DataFrames.")
 
+    key_components = ["trial_index", "arm_name"]
+
+    # Get each trial-arm with parameters
+    arms_df = pd.DataFrame()
+    for trial_index, trial in exp.trials.items():
+        for arm in trial.arms:
+            arms_df = arms_df.append(
+                {"arm_name": arm.name, "trial_index": trial_index, **arm.parameters},
+                ignore_index=True,
+            )
+
+    # Fetch results; in case arms_df is empty, return empty results (legacy behavior)
     results = exp.fetch_data(metrics, **kwargs).df
-    if len(results.index) == 0:  # Handle empty case
+    if len(arms_df.index) == 0:
+        if len(results.index) != 0:
+            raise ValueError(
+                "exp.fetch_data().df returned more rows than there are experimental "
+                "arms. This is an inconsistent experimental state. Please report to "
+                "Ax support."
+            )
         return results
 
-    # create key column from key_components
+    # Create key column from key_components
+    arms_df["trial_index"] = arms_df["trial_index"].astype(int)
     key_col = "-".join(key_components)
-    key_vals = results[key_components[0]].astype("str")
-    for key in key_components[1:]:
-        key_vals = key_vals + results[key].astype("str")
-    results[key_col] = key_vals
+    key_vals = arms_df[key_components[0]].astype("str") + arms_df[
+        key_components[1]
+    ].astype("str")
+    arms_df[key_col] = key_vals
 
-    # pivot dataframe from long to wide
-    metric_vals = results.pivot(
-        index=key_col, columns="metric_name", values="mean"
-    ).reset_index()
-
-    # dedupe results by key_components
-    metadata = results[key_components + [key_col]].drop_duplicates()
-    metric_and_metadata = pd.merge(metric_vals, metadata, on=key_col)
-
-    # get params of each arm and merge with deduped results
-    arm_names_and_params = pd.DataFrame(
-        [{"arm_name": name, **arm.parameters} for name, arm in exp.arms_by_name.items()]
-    )
-    exp_df = pd.merge(metric_and_metadata, arm_names_and_params, on="arm_name")
-
-    # add trial status
+    # Add trial status
     trials = exp.trials.items()
     trial_to_status = {index: trial.status.name for index, trial in trials}
-    exp_df["trial_status"] = [
-        trial_to_status[trial_index] for trial_index in exp_df.trial_index
+    arms_df["trial_status"] = [
+        trial_to_status[trial_index] for trial_index in arms_df.trial_index
     ]
 
-    # add and generator_run model keys
-    exp_df["generator_model"] = [
+    # Add and generator_run model keys
+    arms_df["generator_model"] = [
         # This accounts for the generic case that generator_runs is a list of arbitrary
         # length. If all elements are `None`, this yields an empty string. Repeated
         # generator models within a trial are condensed via a set comprehension.
@@ -312,46 +331,87 @@ def exp_to_df(
         )
         if trial_index in exp.trials
         else ""
-        for trial_index in exp_df.trial_index
+        for trial_index in arms_df.trial_index
     ]
 
     # replace all unknown generator_models (denoted by empty strings) with "Unknown"
-    exp_df["generator_model"] = [
+    arms_df["generator_model"] = [
         "Unknown" if generator_model == "" else generator_model
-        for generator_model in exp_df["generator_model"]
+        for generator_model in arms_df["generator_model"]
     ]
 
-    # if no run_metadata fields are requested, return exp_df so far
-    if run_metadata_fields is None:
-        return prep_return(df=exp_df, drop_col=key_col, sort_by=key_components)
-    if not isinstance(run_metadata_fields, list):
-        raise ValueError("run_metadata_fields must be List[str] or None.")
-
-    # add additional run_metadata fields
-    for field in run_metadata_fields:
-        trial_to_metadata_field = {
-            index: (trial.run_metadata[field] if field in trial.run_metadata else None)
-            for index, trial in trials
-        }
-        if any(trial_to_metadata_field.values()):  # field present for any trial
-            if not all(trial_to_metadata_field.values()):  # not present for all trials
-                logger.warning(
-                    f"Field {field} missing for some trials' run_metadata. "
-                    "Returning None when missing."
-                )
-            exp_df[field] = [trial_to_metadata_field[key] for key in exp_df.trial_index]
-        else:
-            logger.warning(
-                f"Field {field} missing for all trials' run_metadata. "
-                "Not appending column."
+    # Add any run_metadata fields to arms_df
+    if run_metadata_fields is not None:
+        if not (
+            isinstance(run_metadata_fields, list)
+            and all(isinstance(field, str) for field in run_metadata_fields)
+        ):
+            raise ValueError(
+                "run_metadata_fields must be List[str] or None. "
+                f"Got {run_metadata_fields}"
             )
-    return prep_return(df=exp_df, drop_col=key_col, sort_by=key_components)
+
+        # add additional run_metadata fields
+        for field in run_metadata_fields:
+            trial_to_metadata_field = {
+                index: (
+                    trial.run_metadata[field] if field in trial.run_metadata else None
+                )
+                for index, trial in trials
+            }
+            if any(trial_to_metadata_field.values()):  # field present for any trial
+                if not all(
+                    trial_to_metadata_field.values()
+                ):  # not present for all trials
+                    logger.warning(
+                        f"Field {field} missing for some trials' run_metadata. "
+                        "Returning None when missing."
+                    )
+                arms_df[field] = [
+                    trial_to_metadata_field[key] for key in arms_df.trial_index
+                ]
+            else:
+                logger.warning(
+                    f"Field {field} missing for all trials' run_metadata. "
+                    "Not appending column."
+                )
+
+    if len(results.index) == 0:
+        logger.info(
+            f"No results present for the specified metrics `{metrics}`. "
+            "Returning arm parameters and metadata only."
+        )
+        exp_df = arms_df
+    elif not all(col in results.columns for col in key_components):
+        logger.warn(
+            f"At least one of key columns `{key_components}` not present in results df "
+            f"`{results}`. Returning arm parameters and metadata only."
+        )
+        exp_df = arms_df
+    else:
+        # prepare results for merge
+        key_vals = results[key_components[0]].astype("str") + results[
+            key_components[1]
+        ].astype("str")
+        results[key_col] = key_vals
+        metric_vals = results.pivot(
+            index=key_col, columns="metric_name", values="mean"
+        ).reset_index()
+
+        # dedupe results by key_components
+        metadata = results[key_components + [key_col]].drop_duplicates()
+        metrics_df = pd.merge(metric_vals, metadata, on=key_col)
+
+        # merge and return
+        exp_df = pd.merge(
+            metrics_df, arms_df, on=key_components + [key_col], how="outer"
+        )
+    return prep_return(df=exp_df, drop_col=key_col, sort_by=["arm_name"])
 
 
 def get_best_trial(
     exp: Experiment,
     additional_metrics: Optional[List[Metric]] = None,
-    key_components: Optional[List[str]] = None,
     run_metadata_fields: Optional[List[str]] = None,
     **kwargs: Any,
 ) -> Optional[pd.DataFrame]:
@@ -364,9 +424,6 @@ def get_best_trial(
         exp: An Experiment that may have pending trials.
         additional_metrics: List of metrics to return in addition to the objective
             metric. Return all metrics if None.
-        key_components: fields that combine to make a unique key corresponding
-            to rows, similar to the list of fields passed to a GROUP BY.
-            Defaults to ['arm_name', 'trial_index'].
         run_metadata_fields: fields to extract from trial.run_metadata for trial
             in experiment.trials. If there are multiple arms per trial, these
             fields will be replicated across the arms of a trial.
@@ -379,13 +436,13 @@ def get_best_trial(
     objective = not_none(exp.optimization_config).objective
     if isinstance(objective, MultiObjective):
         logger.warning(
-            "No best trial is available for MultiObjective optimization. "
+            "No best trial is available for `MultiObjective` optimization. "
             "Returning None for best trial."
         )
         return None
     if isinstance(objective, ScalarizedObjective):
         logger.warning(
-            "No best trial is available for ScalarizedObjective optimization. "
+            "No best trial is available for `ScalarizedObjective` optimization. "
             "Returning None for best trial."
         )
         return None
@@ -396,15 +453,22 @@ def get_best_trial(
     trials_df = exp_to_df(
         exp=exp,
         metrics=additional_metrics,
-        key_components=key_components,
         run_metadata_fields=run_metadata_fields,
         **kwargs,
     )
     if len(trials_df.index) == 0:
-        logger.warning("exp_to_df returned 0 trials. Returning None for best trial.")
+        logger.warning("`exp_to_df` returned 0 trials. Returning None for best trial.")
         return None
+
     metric_name = objective.metric.name
     minimize = objective.minimize
+    if metric_name not in trials_df.columns:
+        logger.warning(
+            f"`exp_to_df` did not have data for metric {metric_name}. "
+            "Returning None for best trial."
+        )
+        return None
+
     metric_optimum = (
         trials_df[metric_name].min() if minimize else trials_df[metric_name].max()
     )

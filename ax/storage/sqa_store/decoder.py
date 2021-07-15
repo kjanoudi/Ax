@@ -4,6 +4,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 from collections import OrderedDict, defaultdict
 from enum import Enum
 from typing import List, Optional, Tuple, Type, Union
@@ -920,6 +921,17 @@ class Decoder:
             if trial_sqa.run_metadata is not None
             else None
         )
+        # pyre-fixme[9]: _run_metadata has type `Dict[str, Any]`; used as
+        #  `Optional[Dict[str, Any]]`.
+        # pyre-fixme[8]: Attribute has type `Dict[str, typing.Any]`; used as
+        #  `Optional[typing.Dict[Variable[_KT], Variable[_VT]]]`.
+        trial._stop_metadata = (
+            # pyre-fixme[6]: Expected `Mapping[Variable[_KT], Variable[_VT]]` for
+            #  1st param but got `Optional[Dict[str, typing.Any]]`.
+            dict(trial_sqa.stop_metadata)
+            if trial_sqa.stop_metadata is not None
+            else None
+        )
         trial._num_arms_created = trial_sqa.num_arms_created
         trial._runner = (
             self.runner_from_sqa(trial_sqa.runner) if trial_sqa.runner else None
@@ -937,12 +949,21 @@ class Decoder:
         """Convert SQLAlchemy Data to AE Data."""
         # TODO: extract data type from SQAData after DataRegistry added.
         data_constructor = data_constructor or Data
+        kwargs = data_constructor.deserialize_init_args(
+            args=dict(
+                json.loads(data_sqa.structure_metadata_json)
+                if data_sqa.structure_metadata_json
+                else {}
+            )
+        )
+
         # pyre-ignore[45]: Cannot instantiate abstract class. But this is concrete.
         dat = data_constructor(
             description=data_sqa.description,
             # NOTE: Need dtype=False, otherwise infers arm_names like
             # "4_1" should be int 41.
             df=pd.read_json(data_sqa.data_json, dtype=False),
+            **kwargs,
         )
         dat.db_id = data_sqa.id
         return dat
